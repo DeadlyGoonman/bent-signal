@@ -2,6 +2,8 @@
 
 Stereo micro-pitch doubler as a standalone VST3 plugin (Windows x64), with its own Win32 editor. Rust; DSP from the `soundcraft-dsp` crate.
 
+![Shifter editor](docs/shifter-ui.png)
+
 ## Modes
 - **Twin**: static doubler. Left voice tuned up, right voice down, right voice slightly earlier.
 - **Drift**: Twin with a slow LFO nudging detune and delay, like a gentle chorus.
