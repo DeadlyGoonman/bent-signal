@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Shifter VST3 MSI (WiX v5). Built by scripts/package.ps1:
+       wix build shifter.wxs -arch x64 -d Version=0.1.0 -d BundleDir=... -o out.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Shifter VST3"
+      Manufacturer="Shifter"
+      Version="$(var.Version)"
+      UpgradeCode="7C3D9A52-4B1E-4F86-A0D7-2E5B8C61F394"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="Shifter VST3 plugin" Manufacturer="Shifter" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of Shifter VST3 is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="CommonFiles64Folder">
+      <Directory Id="Vst3Folder" Name="VST3">
+        <Directory Id="BundleFolder" Name="Shifter.vst3">
+          <Directory Id="ContentsFolder" Name="Contents">
+            <Directory Id="BinFolder" Name="x86_64-win" />
+            <Directory Id="ResFolder" Name="Resources" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="Shifter VST3" Level="1">
+      <ComponentRef Id="ShifterBinary" />
+      <ComponentRef Id="ShifterResources" />
+    </Feature>
+
+    <!-- The shared VST3 folder is left in place on uninstall by Windows Installer if non-empty. -->
+    <Component Id="ShifterBinary" Directory="BinFolder" Guid="B4E1A7D3-62C9-4D0F-9A58-1F7E3C2D8B60">
+      <File Id="ShifterDll" Source="$(var.BundleDir)\Contents\x86_64-win\Shifter.vst3" KeyPath="yes" />
+    </Component>
+    <Component Id="ShifterResources" Directory="ResFolder" Guid="D96F2C18-E3A4-47B5-8C71-5A0B9E4F6D23">
+      <CreateFolder />
+      <RegistryValue Root="HKLM" Key="Software\Shifter\VST3" Name="Version" Value="$(var.Version)" Type="string" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

@@ -1,0 +1,555 @@
+#![deny(clippy::unwrap_used, clippy::expect_used, clippy::panic, clippy::unimplemented, clippy::todo, clippy::unreachable)]
+//! SoundCraft DSP.
+//!
+//! Realtime plugins (EQ, dynamics, reverb, delay, modulation, harmonic, pitch, utilities and three
+//! instruments), metering (peak, RMS, ITU-R BS.1770 loudness), spectrum analysis and offline
+//! AudioSuite-style whole-buffer processing.
+//!
+//! Every algorithm here is an original implementation of textbook DSP (RBJ cookbook biquads,
+//! feed-forward log-domain dynamics, feedback-delay-network reverbs, WSOLA, windowed-sinc
+//! resampling). Plugins never panic on any parameter value: NaN falls back to the default and
+//! infinities clamp to the range. `Plugin::process` never allocates; buffers are sized in
+//! `Plugin::prepare`.
+//!
+//! Audio is planar `f32`: `io[channel][frame]`.
+
+pub mod biquad;
+pub mod meter;
+pub mod offline;
+mod osc;
+pub mod pan;
+mod params;
+pub mod pitch_detect;
+pub mod plugins;
+pub mod spectrum;
+mod util;
+
+pub use offline::FadeShape;
+pub use osc::Waveform;
+pub use plugins::eq::{eq1_response, eq7_response};
+
+use std::sync::Arc;
+
+/// Plugin category, used to group the insert menu.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+pub enum Category {
+    Eq,
+    Dynamics,
+    PitchShift,
+    Reverb,
+    Delay,
+    Modulation,
+    Harmonic,
+    Dither,
+    Instrument,
+    Other,
+}
+
+/// Display unit of a parameter.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub enum Unit {
+    None,
+    Db,
+    Hz,
+    Ms,
+    Percent,
+    Ratio,
+    Semitones,
+    Cents,
+    Seconds,
+    Toggle,
+    Choice,
+}
+
+/// How a control maps its 0..1 travel onto the parameter range.
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub enum Taper {
+    Linear,
+    Log,
+}
+
+/// Static description of one plugin parameter.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct ParamInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    pub min: f32,
+    pub max: f32,
+    pub default: f32,
+    pub unit: Unit,
+    pub taper: Taper,
+    /// Labels for `Unit::Choice` parameters (value is the index).
+    pub choices: &'static [&'static str],
+}
+
+impl ParamInfo {
+    /// Clamps any value (including NaN/inf) into this parameter's legal range.
+    /// NaN becomes the default; toggles and choices round to whole numbers.
+    pub fn clamp(&self, value: f32) -> f32 {
+        let v = if value.is_nan() { self.default } else { value };
+        let v = v.clamp(self.min, self.max);
+        match self.unit {
+            Unit::Toggle | Unit::Choice => v.round().clamp(self.min, self.max),
+            _ => v,
+        }
+    }
+
+    /// Maps a value to 0..1 control travel honoring the taper.
+    pub fn to_normalized(&self, value: f32) -> f32 {
+        let v = self.clamp(value);
+        let span = self.max - self.min;
+        if span <= 0.0 {
+            return 0.0;
+        }
+        match self.taper {
+            Taper::Log if self.min > 0.0 => ((v / self.min).ln() / (self.max / self.min).ln()).clamp(0.0, 1.0),
+            _ => ((v - self.min) / span).clamp(0.0, 1.0),
+        }
+    }
+
+    /// Maps 0..1 control travel back to a value honoring the taper.
+    pub fn from_normalized(&self, t: f32) -> f32 {
+        let t = if t.is_nan() { 0.0 } else { t.clamp(0.0, 1.0) };
+        let v = match self.taper {
+            Taper::Log if self.min > 0.0 => self.min * (self.max / self.min).powf(t),
+            _ => self.min + (self.max - self.min) * t,
+        };
+        self.clamp(v)
+    }
+
+    /// Human-readable label for a value (choice label, On/Off, or number with unit).
+    pub fn format(&self, value: f32) -> String {
+        let v = self.clamp(value);
+        match self.unit {
+            Unit::Choice => self.choices.get(v as usize).map(|s| (*s).to_string()).unwrap_or_else(|| format!("{v}")),
+            Unit::Toggle => if v >= 0.5 { "On" } else { "Off" }.to_string(),
+            Unit::Db => {
+                if v <= -95.9 {
+                    "-inf dB".to_string()
+                } else {
+                    format!("{v:.1} dB")
+                }
+            }
+            Unit::Hz => {
+                if v >= 1000.0 {
+                    format!("{:.2} kHz", v / 1000.0)
+                } else {
+                    format!("{v:.1} Hz")
+                }
+            }
+            Unit::Ms => format!("{v:.1} ms"),
+            Unit::Percent => format!("{v:.0}%"),
+            Unit::Ratio => format!("{v:.1}:1"),
+            Unit::Semitones => format!("{v:.0} st"),
+            Unit::Cents => format!("{v:.0} ct"),
+            Unit::Seconds => format!("{v:.2} s"),
+            Unit::None => format!("{v:.2}"),
+        }
+    }
+}
+
+/// Static description of a plugin.
+#[derive(Debug, Clone, PartialEq, serde::Serialize)]
+pub struct PluginInfo {
+    pub id: &'static str,
+    pub name: &'static str,
+    /// At most 8 characters, for insert slots.
+    pub short_name: &'static str,
+    pub category: Category,
+    pub params: &'static [ParamInfo],
+    pub is_instrument: bool,
+    /// Usable as an offline (AudioSuite-style) process.
+    pub audiosuite: bool,
+}
+
+impl PluginInfo {
+    /// Looks up a parameter description by id.
+    pub fn param(&self, id: &str) -> Option<&'static ParamInfo> {
+        self.params.iter().find(|p| p.id == id)
+    }
+}
+
+/// The host's transport at the start of a block, for tempo-synced plugins.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct Transport {
+    pub playing: bool,
+    pub recording: bool,
+    /// Quarter notes per minute.
+    pub tempo: f64,
+    pub numerator: u32,
+    pub denominator: u32,
+    /// Timeline position.
+    pub samples: i64,
+    pub seconds: f64,
+    pub quarters: f64,
+    /// Start of the current bar, in quarter notes, and its number (0 for the first bar).
+    pub bar_start: f64,
+    pub bar: i64,
+}
+
+/// A realtime audio processor or instrument.
+///
+/// Contract: `process` never allocates or panics. It processes `min(frames, io[c].len())` frames
+/// of at most the channel count given to `prepare`; extra channels are left untouched.
+/// Instruments replace the buffer contents with their output.
+pub trait Plugin: Send {
+    fn info(&self) -> &'static PluginInfo;
+    fn prepare(&mut self, sample_rate: f32, max_block: usize, channels: usize);
+    fn reset(&mut self);
+    /// Sets a parameter (clamped into range; NaN becomes the default). `false` if `id` is unknown.
+    fn set_param(&mut self, id: &str, value: f32) -> bool;
+    fn param(&self, id: &str) -> Option<f32>;
+    /// In-place processing of `channels` planar buffers each `frames` long.
+    fn process(&mut self, io: &mut [Vec<f32>], frames: usize);
+    /// Hands queued parameter changes to the plugin while nothing is processed (transport
+    /// stopped). Plugins whose editor mirrors the processor (Waves) show a host-set value, such
+    /// as an undo, only once it got there.
+    fn flush_params(&mut self) {}
+    /// Processing latency in samples (for delay compensation).
+    fn latency(&self) -> usize {
+        0
+    }
+    /// How long the output keeps ringing after the input stops, in samples.
+    fn tail_samples(&self) -> usize {
+        0
+    }
+    /// Gain reduction in dB for metering (a non-negative amount); 0 for non-dynamics plugins.
+    fn gain_reduction_db(&self) -> f32 {
+        0.0
+    }
+    /// Number of sidechain input channels (0 = the plugin has no sidechain input).
+    fn sidechain_channels(&self) -> usize {
+        0
+    }
+    /// The sidechain signal for the next block, planar channels (`None` = silence). Given before
+    /// every `process`; never allocates.
+    fn set_sidechain(&mut self, _src: Option<&[Vec<f32>]>) {}
+    /// The transport for the next block, given before `process`.
+    fn set_transport(&mut self, _transport: &Transport) {}
+    /// Instruments: note events at sample offsets within the next block.
+    fn note_on(&mut self, _offset: usize, _note: u8, _velocity: u8) {}
+    fn note_off(&mut self, _offset: usize, _note: u8) {}
+    /// Instruments: any other MIDI 1.0 channel message (control change, pitch bend, pressure,
+    /// program change) at a sample offset within the next block.
+    fn midi(&mut self, _offset: usize, _msg: [u8; 3]) {}
+    fn all_notes_off(&mut self) {}
+    /// Sample-playing instruments (the Sampler): the recorded audio to play, `None` to clear it.
+    /// `false` when the plugin does not play samples. Does not allocate; sounding voices stop.
+    /// The previous sample is dropped here, so hosts keep their own reference to it (the
+    /// session's source pool does) to keep deallocation off the audio thread.
+    fn set_sample(&mut self, _sample: Option<Arc<dyn SampleSource>>) -> bool {
+        false
+    }
+    /// The plugin's complete internal state as an opaque blob (third-party plugins), as its
+    /// [`Plugin::state_reader`] reads it. `None` when the plugin has no state beyond its
+    /// parameters (built-ins) or the plugin refused. May allocate: never call it in steady-state
+    /// audio processing.
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self.state_reader()?.save_state()
+    }
+    /// Restores a blob from [`Plugin::save_state`]. `false` if unsupported or the plugin rejected
+    /// it (the plugin keeps working with its previous state). The data is hostile input.
+    fn load_state(&mut self, _data: &[u8]) -> bool {
+        false
+    }
+    /// Opens the plugin's own editor window (GUI). Main (UI) thread only.
+    fn open_editor(&mut self) -> Result<(), String> {
+        Err("no editor".into())
+    }
+    /// Closes the editor opened with [`Plugin::open_editor`] (no-op when none is open).
+    fn close_editor(&mut self) {}
+    /// A handle to this instance's editor that can be used on the UI thread while the instance
+    /// itself is processing on the audio thread (`None` when the plugin has no editor). The
+    /// handle stays valid after the instance is dropped (its calls then do nothing).
+    fn editor(&mut self) -> Option<Box<dyn PluginEditor>> {
+        None
+    }
+    /// Reads this instance's state from the UI thread (`None` when it has no state of its own).
+    fn state_reader(&mut self) -> Option<Box<dyn PluginStateReader>> {
+        None
+    }
+}
+
+/// A plugin's editor (GUI), driven from the main (UI) thread. Obtained from
+/// [`Plugin::editor`]; the plugin instance may meanwhile run on the audio thread (plugin formats
+/// allow GUI calls on the main thread concurrently with processing on the audio thread).
+pub trait PluginEditor: Send {
+    /// Opens (or raises) the editor window. Main thread only; an error says why it can't.
+    fn open(&mut self) -> Result<(), String>;
+    /// Closes the editor window.
+    fn close(&mut self);
+    fn is_open(&self) -> bool;
+    /// Call every UI frame while open: services the plugin's GUI requests, notices a window the
+    /// user closed, and returns parameter edits made in the editor as `(param id, value)` in
+    /// SoundCraft units (ids and ranges of [`PluginInfo::params`]).
+    fn idle(&mut self) -> Vec<(String, f32)>;
+    /// Tells the editor that a parameter changed elsewhere (generic editor, automation), so the
+    /// GUI shows it. Values are in SoundCraft units.
+    fn set_param(&mut self, _id: &str, _value: f32) {}
+    /// The plugin's own text for a parameter value (SoundCraft units) when SoundCraft's
+    /// [`ParamInfo::format`] would be wrong for it. Main thread only; `None` means "format it
+    /// yourself".
+    fn value_text(&mut self, _id: &str, _value: f32) -> Option<String> {
+        None
+    }
+    /// True when the plugin can draw itself at another size (VST3 content scale or a resizable
+    /// view, CLAP `set_scale`/`set_size`). Main thread only.
+    fn native_scaling(&mut self) -> bool {
+        false
+    }
+    /// Sets how the editor is scaled. Applies to an open editor (it may close and reopen) and to
+    /// the next open. An error says why this mode can't be used for this plugin.
+    fn set_scale(&mut self, _scale: EditorScale) -> Result<(), String> {
+        Err("this editor cannot be scaled".into())
+    }
+    /// True when the plugin has a sidechain input (the header then offers a source picker).
+    fn has_sidechain(&mut self) -> bool {
+        false
+    }
+    /// Shows SoundCraft's state in the header strip of the editor window (bypass, delta, scale).
+    /// Called by the UI every frame; a no-op for editors without a header.
+    fn set_header(&mut self, _state: EditorHeaderState) {}
+    /// Clicks made in the editor window's header since the last call, oldest first.
+    fn take_header_actions(&mut self) -> Vec<EditorHeaderAction> {
+        Vec::new()
+    }
+}
+
+/// One choice of the header's sidechain picker: a bus id and the text shown for it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SidechainChoice {
+    pub bus: u64,
+    pub label: String,
+}
+
+/// The header's sidechain picker: shown only when the plugin has a sidechain input.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SidechainMenu {
+    /// The chosen bus id (`None` = no sidechain).
+    pub current: Option<u64>,
+    /// The button's text after "SC: " ("None" or the bus name).
+    pub label: String,
+    /// Every bus some send targets.
+    pub choices: Vec<SidechainChoice>,
+}
+
+/// What the header strip on top of a plugin editor window shows.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct EditorHeaderState {
+    /// The insert is bypassed.
+    pub bypass: bool,
+    /// Delta monitoring (wet minus dry) is on.
+    pub delta: bool,
+    /// The slot holds an instrument (no dry signal, so delta is unavailable).
+    pub is_instrument: bool,
+    pub scale: EditorScale,
+    /// The plugin can draw itself at another size.
+    pub native_scaling: bool,
+    /// The plugin's view can be given another size (without a scale factor).
+    pub can_resize: bool,
+    /// The editor window sends SoundCraft's shortcut keys (Space = play/stop, ...) to the app
+    /// instead of the plugin.
+    pub keys: bool,
+    /// The colour of the track the editor is open on; the window's title bar takes it.
+    pub color: Option<[u8; 3]>,
+    /// The sidechain picker (`None`: the plugin has no sidechain input).
+    pub sidechain: Option<SidechainMenu>,
+}
+
+/// A click in an editor window's header, for the UI to apply as a command.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum EditorHeaderAction {
+    SetBypass(bool),
+    SetDelta(bool),
+    /// A scale chosen by dragging the window frame.
+    SetScale(EditorScale),
+    /// The header's Keys toggle: send shortcut keys to SoundCraft while the editor has focus.
+    SetKeys(bool),
+    /// A shortcut key pressed in the editor while Keys is on, for the app to handle as if pressed
+    /// in its own window.
+    Key(EditorKey),
+    /// The header's sidechain picker: the chosen bus id, `None` for no sidechain.
+    SetSidechain(Option<u64>),
+}
+
+/// A key press forwarded from a plugin editor window: an egui key name (`egui::Key::from_name`)
+/// and the modifiers held.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EditorKey {
+    pub name: &'static str,
+    pub ctrl: bool,
+    pub shift: bool,
+    pub alt: bool,
+}
+
+/// The filter that stretches a plugin editor drawn at its own size (host-side upscaling).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum UpscaleFilter {
+    /// AMD FidelityFX Super Resolution 1 (EASU upscale + RCAS sharpen).
+    #[default]
+    Fsr1,
+    /// NVIDIA Image Scaling.
+    Nis,
+    Bilinear,
+}
+
+/// How a plugin editor reaches its scale factor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
+pub enum EditorScaleMode {
+    /// Native when the plugin supports it, otherwise upscaled with FSR 1.
+    #[default]
+    Auto,
+    /// The plugin draws itself at the scale (error when it can't).
+    Native,
+    /// The plugin draws at its own size and the host stretches the picture.
+    Upscale(UpscaleFilter),
+}
+
+/// A plugin editor's scale: `factor` 1.0 is the plugin's own size (valid range 0.5..=4.0).
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct EditorScale {
+    pub factor: f32,
+    pub mode: EditorScaleMode,
+}
+
+impl Default for EditorScale {
+    fn default() -> Self {
+        EditorScale { factor: 1.0, mode: EditorScaleMode::Auto }
+    }
+}
+
+impl EditorScale {
+    /// The factor clamped to 0.5..=4.0 (1.0 for NaN).
+    pub fn clamped_factor(&self) -> f32 {
+        if self.factor.is_finite() { self.factor.clamp(0.5, 4.0) } else { 1.0 }
+    }
+}
+
+/// Reads a plugin's state on the main (UI) thread while the instance processes on the audio
+/// thread, as plugin formats allow. Obtained from [`Plugin::state_reader`]; closures are readers.
+pub trait PluginStateReader: Send {
+    /// What [`Plugin::save_state`] would return; `None` once the instance is gone.
+    fn save_state(&mut self) -> Option<Vec<u8>>;
+}
+
+impl<F: FnMut() -> Option<Vec<u8>> + Send> PluginStateReader for F {
+    fn save_state(&mut self) -> Option<Vec<u8>> {
+        self()
+    }
+}
+
+/// Recorded audio a sample-playing instrument reads: planar `f32` at its own sample rate (the
+/// instrument converts rates as it plays). Implementations must be cheap to read from the audio
+/// thread: no locks, no I/O.
+pub trait SampleSource: Send + Sync {
+    /// Sample rate of the audio in Hz.
+    fn sample_rate(&self) -> f32;
+    fn num_channels(&self) -> usize;
+    /// One channel's frames (`None` past the last channel).
+    fn channel(&self, ch: usize) -> Option<&[f32]>;
+    /// Frames per channel (the shortest channel, so every index below it is readable).
+    fn frames(&self) -> usize {
+        (0..self.num_channels()).filter_map(|c| self.channel(c)).map(<[f32]>::len).min().unwrap_or(0)
+    }
+}
+
+/// A sample held in memory (tests, generated audio).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct SampleBuffer {
+    pub sample_rate: f32,
+    pub channels: Vec<Vec<f32>>,
+}
+
+impl SampleSource for SampleBuffer {
+    fn sample_rate(&self) -> f32 {
+        self.sample_rate
+    }
+    fn num_channels(&self) -> usize {
+        self.channels.len()
+    }
+    fn channel(&self, ch: usize) -> Option<&[f32]> {
+        self.channels.get(ch).map(Vec::as_slice)
+    }
+}
+
+/// The plugin registry.
+pub fn plugins() -> &'static [&'static PluginInfo] {
+    plugins::REGISTRY
+}
+
+/// Creates a plugin by id, prepared for 48 kHz stereo with 1024-frame blocks.
+/// Hosts should call `prepare` again with their real settings.
+pub fn create(id: &str) -> Option<Box<dyn Plugin>> {
+    let mut p = plugins::instantiate(id)?;
+    p.prepare(48_000.0, 1024, 2);
+    Some(p)
+}
+
+/// Looks up a plugin description by id.
+pub fn plugin_info(id: &str) -> Option<&'static PluginInfo> {
+    plugins::REGISTRY.iter().copied().find(|i| i.id == id)
+}
+
+/// Whether a plugin makes sound instead of processing its input (it ignores the input).
+pub fn is_generator(id: &str) -> bool {
+    id == "signal_generator"
+}
+
+/// Silence floor used by the dB helpers.
+pub const MIN_DB: f32 = -144.0;
+
+/// Converts decibels to linear gain. Anything at or below -144 dB (or NaN) is silence.
+pub fn db_to_gain(db: f32) -> f32 {
+    if db.is_nan() || db <= MIN_DB { 0.0 } else { 10f32.powf(db.min(200.0) / 20.0) }
+}
+
+/// Converts linear gain (sign ignored) to decibels, floored at -144 dB.
+pub fn gain_to_db(g: f32) -> f32 {
+    let a = g.abs();
+    if a.is_nan() {
+        return MIN_DB;
+    }
+    if a.is_infinite() {
+        return f32::MAX;
+    }
+    (20.0 * a.log10()).max(MIN_DB)
+}
+
+/// MIDI note number to frequency in Hz (equal temperament, A4 = note 69 = 440 Hz).
+pub fn midi_to_hz(note: f64) -> f64 {
+    440.0 * 2f64.powf((note - 69.0) / 12.0)
+}
+
+#[cfg(test)]
+mod trait_default_tests {
+    use super::*;
+
+    #[test]
+    fn built_ins_have_no_state_or_editor() {
+        for info in plugins() {
+            let mut p = create(info.id).unwrap();
+            assert!(p.save_state().is_none(), "{}", info.id);
+            assert!(!p.load_state(b"anything"), "{}", info.id);
+            assert!(p.open_editor().is_err(), "{}", info.id);
+            p.close_editor();
+            assert!(p.editor().is_none(), "{}", info.id);
+        }
+    }
+
+    #[test]
+    fn only_the_sampler_takes_samples() {
+        for info in plugins() {
+            let mut p = create(info.id).unwrap();
+            let s: Arc<dyn SampleSource> = Arc::new(SampleBuffer { sample_rate: 48_000.0, channels: vec![vec![0.0; 16]] });
+            assert_eq!(p.set_sample(Some(s)), info.id == "sampler", "{}", info.id);
+            assert_eq!(p.set_sample(None), info.id == "sampler", "{}", info.id);
+        }
+    }
+
+    #[test]
+    fn sample_buffer_frames_is_the_shortest_channel() {
+        let s = SampleBuffer { sample_rate: 44_100.0, channels: vec![vec![0.0; 10], vec![0.0; 7]] };
+        assert_eq!(s.frames(), 7);
+        assert_eq!(SampleBuffer::default().frames(), 0);
+    }
+}
