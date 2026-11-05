@@ -6,7 +6,7 @@
   scripts\package.ps1 -Plugin Plumb
 #>
 param(
-  [ValidateSet('Shifter', 'Plumb', 'Grit', 'All')] [string] $Plugin = 'All',
+  [ValidateSet('Shifter', 'Plumb', 'Grit', 'Bundle', 'All')] [string] $Plugin = 'All',
   [string] $TargetDir = $(if ($env:CARGO_TARGET_DIR) { $env:CARGO_TARGET_DIR } else { 'D:\ai\Projects\bt-shifter-build' }),
   [switch] $SkipBuild
 )
@@ -29,7 +29,7 @@ foreach ($line in Get-Content (Join-Path $Root 'Cargo.toml')) {
 }
 if (-not $Version) { throw 'no [workspace.package] version in Cargo.toml' }
 
-$Names = if ($Plugin -eq 'All') { 'Shifter', 'Plumb', 'Grit' } else { @($Plugin) }
+$Names = if ($Plugin -eq 'All') { 'Shifter', 'Plumb', 'Grit' } elseif ($Plugin -eq 'Bundle') { @() } else { @($Plugin) }
 $Dist = Join-Path $Root 'dist'
 New-Item -ItemType Directory -Force $Dist | Out-Null
 
@@ -57,6 +57,16 @@ foreach ($Name in $Names) {
   if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
   Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
 
+  Write-Output "MSI: $Msi"
+  Write-Output "SHA256: $((Get-FileHash $Msi -Algorithm SHA256).Hash)"
+}
+
+if ($Plugin -eq 'All' -or $Plugin -eq 'Bundle') {
+  $Msi = Join-Path $Dist "BentSignal-VST3-Bundle-$Version-x64.msi"
+  wix build (Join-Path $Root 'installer\bundle.wxs') -arch x64 -d "Version=$Version" `
+    -d "PlumbDll=$(Join-Path $TargetDir 'release\Plumb.dll')" -d "ShifterDll=$(Join-Path $TargetDir 'release\Shifter.dll')" -d "GritDll=$(Join-Path $TargetDir 'release\Grit.dll')" -o $Msi
+  if ($LASTEXITCODE -ne 0) { throw "wix build failed ($LASTEXITCODE)" }
+  Remove-Item -Force -ErrorAction SilentlyContinue ([IO.Path]::ChangeExtension($Msi, '.wixpdb'))
   Write-Output "MSI: $Msi"
   Write-Output "SHA256: $((Get-FileHash $Msi -Algorithm SHA256).Hash)"
 }

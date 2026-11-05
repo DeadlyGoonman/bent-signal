@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bent Signal VST3 MSI (WiX v5): Plumb, Shifter and Grit in one installer, each an optional feature.
+     Built by scripts/package.ps1 -Plugin Bundle. -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="Bent Signal VST3 Bundle"
+      Manufacturer="Bent Signal"
+      Version="$(var.Version)"
+      UpgradeCode="6E1B4D93-2A87-4C50-9F3E-B8D5A2C71F06"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="Plumb, Shifter and Grit VST3 plugins" Manufacturer="Bent Signal" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of the Bent Signal VST3 bundle is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="CommonFiles64Folder">
+      <Directory Id="Vst3Folder" Name="VST3">
+        <Directory Id="PlumbFolder" Name="Plumb.vst3"><Directory Id="PlumbContents" Name="Contents"><Directory Id="PlumbBin" Name="x86_64-win" /></Directory></Directory>
+        <Directory Id="ShifterFolder" Name="Shifter.vst3"><Directory Id="ShifterContents" Name="Contents"><Directory Id="ShifterBin" Name="x86_64-win" /></Directory></Directory>
+        <Directory Id="GritFolder" Name="Grit.vst3"><Directory Id="GritContents" Name="Contents"><Directory Id="GritBin" Name="x86_64-win" /></Directory></Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Plumb" Title="Plumb (pitch correction)" Level="1"><ComponentRef Id="PlumbBinary" /></Feature>
+    <Feature Id="Shifter" Title="Shifter (micro-pitch doubler)" Level="1"><ComponentRef Id="ShifterBinary" /></Feature>
+    <Feature Id="Grit" Title="Grit (drive)" Level="1"><ComponentRef Id="GritBinary" /></Feature>
+
+    <Component Id="PlumbBinary" Directory="PlumbBin" Guid="C2A64E18-7D95-4B03-A1F7-5E8D3B09C426">
+      <File Id="PlumbDll" Source="$(var.PlumbDll)" Name="Plumb.vst3" KeyPath="yes" />
+    </Component>
+    <Component Id="ShifterBinary" Directory="ShifterBin" Guid="48D7B1F5-9C32-4E6A-8B05-D1A3F7C29E64">
+      <File Id="ShifterDll" Source="$(var.ShifterDll)" Name="Shifter.vst3" KeyPath="yes" />
+    </Component>
+    <Component Id="GritBinary" Directory="GritBin" Guid="F1938C6A-5B47-4D20-A6E9-0C7B2D84153F">
+      <File Id="GritDll" Source="$(var.GritDll)" Name="Grit.vst3" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

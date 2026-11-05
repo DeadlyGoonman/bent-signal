@@ -18,7 +18,7 @@ See [Plumb vs the competition](docs/vs-competition.md) for measured comparisons.
 
 ## Install
 
-1. Download an `.msi` from the [latest release](../../releases/latest) and run it (needs admin). Each installs one plugin to `C:\Program Files\Common Files\VST3\<Name>.vst3`.
+1. Download an `.msi` from the [latest release](../../releases/latest) and run it (needs admin): `BentSignal-VST3-Bundle` installs all three (pick which in the installer), or take one plugin's MSI. Each plugin goes to `C:\Program Files\Common Files\VST3\<Name>.vst3`.
 2. Rescan plugins in your DAW.
 
 Windows 10/11, 64-bit, VST3 hosts. To uninstall, use Windows' Apps list. Windows may show a SmartScreen warning because the installers are not code-signed: More info → Run anyway.
