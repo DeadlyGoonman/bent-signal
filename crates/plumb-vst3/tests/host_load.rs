@@ -55,8 +55,8 @@ fn the_bundle_loads_and_processes_in_the_soundcraft_host() {
     }
     let info = soundcraft_vst3_host::plugin_info(&d.id).unwrap();
     let ids: Vec<&str> = info.params.iter().map(|p| p.id).collect();
-    assert_eq!(ids, ["0", "1", "2", "3", "4", "5", "7"], "bypass (6) is the host's");
-    assert_eq!(info.param("7").unwrap().choices.len(), 6, "Link: Off and five groups");
+    assert_eq!(ids, ["0", "1", "2", "3", "4", "5", "6", "8"], "bypass (7) is the host's");
+    assert_eq!(info.param("8").unwrap().choices.len(), 6, "Link: Off and five groups");
     let key = info.param("0").unwrap();
     assert_eq!((key.unit, key.choices.len()), (Unit::Choice, 12));
     assert_eq!(info.param("1").unwrap().choices.len(), 13);
@@ -98,7 +98,7 @@ fn the_bundle_loads_and_processes_in_the_soundcraft_host() {
         let d = Plumb::params::decode_state(&blob[at..]).unwrap();
         Plumb::params::to_plain(id, d.values[id as usize])
     };
-    assert!(a.set_param("7", 3.0) && b.set_param("7", 3.0) && other.set_param("7", 1.0));
+    assert!(a.set_param("8", 3.0) && b.set_param("8", 3.0) && other.set_param("8", 1.0));
     for p in [&mut a, &mut b, &mut other, &mut off] {
         block(p);
     }
@@ -111,7 +111,7 @@ fn the_bundle_loads_and_processes_in_the_soundcraft_host() {
     assert_eq!(value(&mut other, 0), 0.0, "another group is untouched");
     assert_eq!(value(&mut off, 0), 0.0, "Off is untouched");
     // A late joiner takes the group's values.
-    assert!(off.set_param("7", 3.0));
+    assert!(off.set_param("8", 3.0));
     block(&mut off);
     assert!(near(value(&mut off, 0), 5.0) && near(value(&mut off, 3), 60.0));
 

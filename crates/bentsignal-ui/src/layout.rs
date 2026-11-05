@@ -8,7 +8,7 @@ use crate::spec::UiSpec;
 pub const SWEEP_START_DEG: f64 = 225.0;
 pub const SWEEP_DEG: f64 = 270.0;
 /// Pixels of vertical mouse travel (at scale 1) for the full knob range.
-pub const DRAG_SPAN: f64 = 220.0;
+pub const DRAG_SPAN: f64 = 330.0;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct Rect {
@@ -542,8 +542,8 @@ mod tests {
         let pts = arc_points(0, 0, 10.0, 0.0, 1.0);
         assert!(pts.len() > 10 && pts.first() == Some(&polar(0, 0, 10.0, 225.0)));
         assert_eq!(drag_value(0.5, 0, 1.0, false), 0.5);
-        assert!((drag_value(0.0, 110, 1.0, false) - 0.5).abs() < 1e-9);
-        assert!((drag_value(0.0, 110, 1.0, true) - 0.1).abs() < 1e-9);
+        assert!((drag_value(0.0, 165, 1.0, false) - 0.5).abs() < 1e-9);
+        assert!((drag_value(0.0, 165, 1.0, true) - 0.1).abs() < 1e-9);
         assert_eq!(drag_value(0.9, 500, 1.0, false), 1.0);
         assert_eq!(drag_value(0.1, -500, 2.0, false), 0.0);
     }

@@ -262,15 +262,16 @@ fn parameters_have_titles_units_steps_and_ranges() {
             (3, "Flex Tune", "%", 0),
             (4, "Reference", "Hz", 0),
             (5, "Mode", "", 1),
-            (6, "Bypass", "", 1),
-            (7, "Sync", "", 5),
+            (6, "Dampen", "%", 0),
+            (7, "Bypass", "", 1),
+            (8, "Sync", "", 5),
         ]
         .iter()
         .map(|&(i, t, u, s)| (i, t.to_string(), u.to_string(), s))
         .collect();
         assert_eq!(seen, want);
         let mut info: ParameterInfo = std::mem::zeroed();
-        assert_ne!(e.getParameterInfo(8, &mut info), kResultOk);
+        assert_ne!(e.getParameterInfo(9, &mut info), kResultOk);
         for id in [SPEED, FLEX, REFERENCE] {
             for n in [0.0, 0.25, 0.5, 1.0] {
                 let back = e.plainParamToNormalized(id, e.normalizedParamToPlain(id, n));

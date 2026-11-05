@@ -128,13 +128,17 @@ pub const SCALE_DEGREES: [&[u8]; 13] = [
 /// Modes: Normal (20 ms, or Lock) and Record (lowest latency, causal).
 pub const MODES: [&str; 2] = ["Normal", "Record"];
 
-static TUNE_PARAMS: [ParamInfo; 6] = [
+/// Dampen at 100% glides between notes over about this long.
+pub const DAMPEN_MAX_MS: f32 = 200.0;
+
+static TUNE_PARAMS: [ParamInfo; 7] = [
     choice("key", "Key", &KEYS, 0),
     choice("scale", "Scale", &SCALES, 1),
     lin("speed", "Retune Speed", SPEED_MIN_MS, SPEED_MAX_MS, 20.0, Unit::Ms),
     lin("flex", "Flex Tune", 0.0, 100.0, 0.0, Unit::Percent),
     lin("reference", "Reference", 420.0, 460.0, 440.0, Unit::Hz),
     choice("mode", "Mode", &MODES, 0),
+    lin("dampen", "Dampen", 0.0, 100.0, 0.0, Unit::Percent),
 ];
 
 pub static TUNE_INFO: PluginInfo = PluginInfo {
@@ -226,6 +230,10 @@ pub struct Tune {
     // Parameters as used.
     mask: u16,
     flex: f32,
+    /// Dampen: per-sample coefficient of the glide between target notes (0 = none).
+    damp_coef: f32,
+    /// The glided target note (MIDI); `None` while unvoiced.
+    note_s: Option<f32>,
     reference: f32,
     coef: f32,
     lock: bool,
@@ -282,6 +290,8 @@ impl Tune {
             prev_note: None,
             mask: 0x0fff,
             flex: 0.0,
+            damp_coef: 0.0,
+            note_s: None,
             reference: 440.0,
             coef: 0.0,
             lock: false,
@@ -325,6 +335,8 @@ impl Tune {
         self.coef = if self.lock { 0.0 } else { time_coef(retune_tau_ms(speed), self.sr) };
         self.flex = (self.p.v(3) / 100.0).clamp(0.0, 1.0);
         self.reference = self.p.v(4);
+        let damp_ms = (self.p.v(6) / 100.0).clamp(0.0, 1.0) * DAMPEN_MAX_MS;
+        self.damp_coef = if damp_ms < 0.5 { 0.0 } else { time_coef(damp_ms / 3.0, self.sr) };
         // Tap delay 1 is the newest sample (no delay), so a latency of n reads at n + 1.
         let d = latency_samples(self.sr, speed, self.record) as f32 + 1.0;
         if d != self.nominal_d {
@@ -591,6 +603,7 @@ impl Plugin for Tune {
         self.latest = None;
         self.last_voiced = None;
         self.prev_note = None;
+        self.note_s = None;
         self.t = 0;
         self.corr = 0.0;
         self.home = 1.0;
@@ -638,7 +651,20 @@ impl Plugin for Tune {
             } else {
                 self.lookup(tau)
             };
-            let target = if entry.voiced { -(1.0 - self.flex) * entry.dev } else { 0.0 };
+            // Dampen: the target note glides to a new note (a fake portamento) instead of stepping;
+            // the output lags the new note by `note_s - note` until it arrives.
+            let mut target = if entry.voiced { -(1.0 - self.flex) * entry.dev } else { 0.0 };
+            if entry.voiced {
+                let note = entry.note as f32;
+                let s = match self.note_s {
+                    Some(s) if self.damp_coef > 0.0 && (note - s).abs() <= 12.0 => note + (s - note) * self.damp_coef,
+                    _ => note,
+                };
+                self.note_s = Some(s);
+                target += s - note;
+            } else {
+                self.note_s = None;
+            }
             if entry.voiced {
                 self.period = entry.period.clamp(self.sr / MAX_HZ, self.sr / MIN_HZ);
             }
@@ -828,6 +854,25 @@ mod tests {
         let mut t = plumb(&[("scale", 1.0), ("speed", 0.0), ("flex", 50.0)]);
         let f = pitch(&run(&mut t, &sine(input, 48_000)), 12_000..44_000);
         assert!((cents(f, 440.0) - 15.0).abs() < 4.0, "half the deviation passes: {} ct", cents(f, 440.0));
+    }
+
+    /// Dampen glides to a new note instead of stepping: shortly after A4 -> B4 the output sits
+    /// below B4 with Dampen up, on it with Dampen at 0; both arrive.
+    #[test]
+    fn dampen_glides_between_notes() {
+        let b4 = 440.0 * 2f32.powf(2.0 / 12.0);
+        let mut x = sine(440.0, 24_000);
+        x.extend(sine(b4, 48_000));
+        let mut at = [0.0f32; 2];
+        for (i, d) in [0.0f32, 100.0].iter().enumerate() {
+            let mut t = plumb(&[("scale", 0.0), ("speed", 0.0), ("dampen", *d)]);
+            let out = run(&mut t, &x);
+            at[i] = pitch(&out, 24_000 + 1_800..24_000 + 3_600);
+            let end = pitch(&out, 60_000..70_000);
+            assert!(cents(end, b4).abs() < 15.0, "dampen {d} arrives: {end} Hz");
+        }
+        eprintln!("early pitch: dampen0 {} Hz, dampen100 {} Hz", at[0], at[1]);
+        assert!(at[1] < at[0] - 1.0, "dampen glides: {} vs {}", at[1], at[0]);
     }
 
     #[test]

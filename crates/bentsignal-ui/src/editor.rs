@@ -357,7 +357,9 @@ impl IPlugViewTrait for View {
         kResultOk
     }
     unsafe fn canResize(&self) -> tresult {
-        kResultTrue
+        // False: the host adds no sizing border (resizable from every edge); the corner grip
+        // resizes through `resizeView`, which hosts honour either way.
+        kResultFalse
     }
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         // SAFETY: the host passes a writable rect or null.
@@ -691,11 +693,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
             type_char(hwnd, w, wp as u32);
             0
         }
-        WM_KILLFOCUS => {
-            finish_typing(w, true);
-            invalidate(hwnd);
-            0
-        }
+        // Typing ends on Enter, Esc or a click elsewhere, not on focus loss: a scaling host moves
+        // the focus around its own windows right after the click and would drop the typed text.
+        WM_KILLFOCUS => 0,
         WM_TIMER => {
             flush_restart(&w.shared);
             let meter = w.shared.meter().to_bits();
