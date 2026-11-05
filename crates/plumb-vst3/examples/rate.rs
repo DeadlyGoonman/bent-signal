@@ -161,6 +161,13 @@ fn main() {
         trace(&c, &l);
         return;
     }
+    if mode == "vocal" {
+        let path = std::env::var("VOCAL").expect("VOCAL=path.wav");
+        let st: f32 = std::env::var("VOC_START").ok().and_then(|s| s.parse().ok()).unwrap_or(10.0);
+        let ln: f32 = std::env::var("VOC_LEN").ok().and_then(|s| s.parse().ok()).unwrap_or(30.0);
+        vocal(&c, &path, st, ln, &[10.0, 15.0, 20.0, 30.0, 50.0]);
+        return;
+    }
     if mode == "scan" {
         // D#4 exactly: Chromatic keeps it, Major in C moves it to D or E.
         let x = voice(0.8, |_| 63.4);
@@ -270,5 +277,74 @@ pub fn trace(c: &Ctx, list: &[(String, Kind)]) {
         print!("{:>6}", i * 10);
         for (_, c) in &cols { print!(" {:>12.1}", c[i]); }
         println!();
+    }
+}
+
+fn read_wav(p: &str) -> Vec<f32> {
+    let b = std::fs::read(p).expect("read");
+    let mut pos = 12usize;
+    while pos + 8 <= b.len() {
+        let n = u32::from_le_bytes(b[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        if &b[pos..pos + 4] == b"data" {
+            let end = (pos + 8 + n).min(b.len());
+            return b[pos + 8..end].chunks_exact(4).map(|c| f32::from_le_bytes(c.try_into().unwrap())).collect();
+        }
+        pos += 8 + n + (n & 1);
+    }
+    panic!("no data");
+}
+
+/// Pitch track for a real voice (25 ms window, 2.5 ms hop).
+fn track_voice(y: &[f32]) -> Vec<(f32, f32)> {
+    let (w, hop) = (1200usize, 120usize);
+    let mut sc = YinScratch::default();
+    sc.reserve(2400);
+    let mut v = Vec::new();
+    let mut i = 0;
+    while i + w <= y.len() {
+        let fr = &y[i..i + w];
+        let rms = (fr.iter().map(|s| s * s).sum::<f32>() / w as f32).sqrt();
+        if rms > 0.003 {
+            if let Some(f) = yin_with(fr, SR, 80.0, 1000.0, 0.15, &mut sc) {
+                v.push(((i + w / 2) as f32 / SR, 69.0 + 12.0 * (f / 440.0).log2()));
+            }
+        }
+        i += hop;
+    }
+    v
+}
+
+/// A real vocal through each tuner (chromatic, flex 0): accuracy to the nearest semitone and how jittery the pitch is.
+pub fn vocal(c: &Ctx, path: &str, start: f32, len: f32, speeds: &[f32]) {
+    let all = read_wav(path);
+    let s0 = (start * SR) as usize;
+    let x: Vec<f32> = all[s0.min(all.len())..((start + len) * SR) as usize].to_vec();
+    let mut rows: Vec<(String, Vec<(f32, f32)>)> = vec![("dry".to_string(), track_voice(&x))];
+    for &s in speeds {
+        let mut t = Tune::new();
+        t.prepare(SR, 512, 2);
+        t.set_param("scale", 0.0);
+        t.set_param("speed", s);
+        t.set_param("flex", 0.0);
+        rows.push((format!("plumb_{s}"), track_voice(&run(&mut t, &x))));
+    }
+    for &s in speeds {
+        let mut p = soundcraft_vst3_host::create(&c.atp.id).expect("atp");
+        p.prepare(SR, 512, 2);
+        p.set_param("162", 0.0);
+        p.set_param("2", 0.0);
+        p.set_param("4", atp_norm(c, s));
+        p.set_param("90", 0.0);
+        rows.push((format!("atp_{s}ms"), track_voice(&run(p.as_mut(), &x))));
+    }
+    println!("{:<12} {:>7} {:>9} {:>8} {:>8} {:>9} {:>9}", "setting", "frames", "within10%", "med_ct", "p90_ct", "jit_med", "jit_p95");
+    for (name, tr) in rows {
+        let dev: Vec<f32> = tr.iter().map(|(_, m)| ((m - m.round()) * 100.0).abs()).collect();
+        let mut d = dev.clone();
+        d.sort_by(f32::total_cmp);
+        let q = |v: &Vec<f32>, f: f32| v.get(((v.len() as f32 * f) as usize).min(v.len().saturating_sub(1))).copied().unwrap_or(0.0);
+        let mut jit: Vec<f32> = tr.windows(2).filter(|w| w[1].0 - w[0].0 < 0.0035 && (w[1].1 - w[0].1).abs() < 0.5).map(|w| (w[1].1 - w[0].1).abs() * 100.0).collect();
+        jit.sort_by(f32::total_cmp);
+        println!("{name:<12} {:>7} {:>8.0}% {:>8.1} {:>8.1} {:>9.2} {:>9.2}", tr.len(), 100.0 * dev.iter().filter(|v| **v < 10.0).count() as f32 / dev.len().max(1) as f32, q(&d, 0.5), q(&d, 0.9), q(&jit, 0.5), q(&jit, 0.95));
     }
 }

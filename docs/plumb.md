@@ -23,3 +23,15 @@ Latency is 20 ms in Normal mode (more in Lock), under 1 ms in Low Lat. The edito
 ## How it works
 
 The input is tracked with YIN. The deviation from the nearest note drives a two-stage smooth glide (Retune) and a rotating-head pitch shifter splices back by whole detected periods, so there is no standing comb filter. Unvoiced sounds (breaths, consonants) pass through untouched.
+
+## Matching other tuners
+
+Plumb's Retune number is calibrated to Auto-Tune Pro's Retune Speed (same ms, same 0-400 range): the same number glides the same way, measured with `crates/plumb-vst3/examples/rate.rs` (a synthetic voice stepped +40 ct, plus a 5.5 Hz vibrato) and on a real vocal. At 20, both land 61% of frames within 10 ct of a semitone, the vibrato is about 72-74% kept in both, and 63% of a pitch step is corrected after about 32-34 ms.
+
+Xpitch's Transition knob (0-1) lands, by the same step-response measure, at roughly:
+
+| Xpitch Transition | 0.1 | 0.15 | 0.2 | 0.3 | 0.5 | 0.7 |
+|---|---|---|---|---|---|---|
+| Plumb / Auto-Tune Retune | 2 | 5 | 12 | 30 | 100 | 190 |
+
+Run it yourself (needs the plugins installed): `rate step`, `rate vib`, or `VOCAL=your.wav rate vocal`.
