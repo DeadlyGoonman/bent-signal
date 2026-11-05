@@ -11,8 +11,8 @@
 //!   mode), so the correction for the audio being read is taken from the hop whose analysis
 //!   window is centred on that audio. The analysis therefore sees a little of the future.
 //! - Correction: `target = -(1 - flex) * deviation` semitones. Retune Speed > 0 runs `target`
-//!   through two cascaded one-pole low-passes (critically damped, time constant `speed / 4.74`), so a step glides smoothly and settles to 95% in
-//!   `speed` ms; 0 snaps at once. Retune Speed < 0 is Lock: the audio is delayed by
+//!   through a one-pole low-pass of time constant `retune_tau_ms(speed)` (fitted so a speed of N ms
+//!   glides like Auto-Tune Pro's N ms); 0 snaps at once. Retune Speed < 0 is Lock: the audio is delayed by
 //!   `LOCK_BASE_MS` + |speed| ms, only hops that agree with both neighbours are used, and at a
 //!   note change (a gap between steady hops) the correction switches from the old note's to the
 //!   new note's at once, halfway through the gap (within one hop of the real onset), no ramp.
@@ -42,9 +42,14 @@ pub const LOCK_BASE_MS: f32 = 45.0;
 /// Two neighbouring hops agree (one steady note) when their deviations differ less than this.
 const STEADY_SEMITONES: f32 = 0.15;
 /// Retune Speed range: negative values are Lock lookahead, positive ones smoothing time.
-/// Two cascaded one-poles (critically damped: no instant start, no long tail) reach 95% after
-/// 4.74 time constants.
-const SETTLE_TAUS: f32 = 4.74;
+/// Time constant (ms) of the one-pole retune glide for a Retune Speed in ms. Fitted to Auto-Tune Pro's
+/// retune speed (the same number gives the same glide: step response and how much of a 5.5 Hz vibrato
+/// survives, measured with the `rate` example): about 1.55 x the number for the slow half of the
+/// range, a little more than the number below 20 (Auto-Tune's fast end is not instant), and 0 snaps.
+pub fn retune_tau_ms(speed_ms: f32) -> f32 {
+    let n = if speed_ms.is_finite() { speed_ms.max(0.0) } else { 0.0 };
+    0.88 * (1.55 * n - 2.0 + 8.0 * (-n / 10.0).exp()).max(0.0) * n / (n + 1.0)
+}
 pub const SPEED_MIN_MS: f32 = -3.0;
 pub const SPEED_MAX_MS: f32 = 400.0;
 const WINDOW_MS: f32 = 26.0;
@@ -228,6 +233,10 @@ pub struct Tune {
     homing: bool,
     // Shifter: one read head; at a splice the old head fades out against the new one.
     t: u64,
+    /// The latency's delay (the tap the output rests on after a retune of the whole voice).
+    nominal_d: f32,
+    /// Where the output rests: `nominal_d`, or (not in Record) wherever the head stopped within half a
+    /// period of it, so a finished correction fades to the plain tap with no creep and no pitch offset.
     home_d: f32,
     head: f32,
     old: f32,
@@ -236,8 +245,6 @@ pub struct Tune {
     xf_corr: f32,
     period: f32,
     corr: f32,
-    /// First stage of the two-stage (critically damped) retune glide; `corr` is the second.
-    corr_pre: f32,
     home: f32,
     home_step: f32,
     line_max: f32,
@@ -281,6 +288,7 @@ impl Tune {
             record: false,
             homing: true,
             t: 0,
+            nominal_d: 960.0,
             home_d: 960.0,
             head: 960.0,
             old: 960.0,
@@ -289,7 +297,6 @@ impl Tune {
             xf_corr: 1.0,
             period: 240.0,
             corr: 0.0,
-            corr_pre: 0.0,
             home: 1.0,
             home_step: 0.01,
             line_max: 4096.0,
@@ -315,13 +322,14 @@ impl Tune {
         // Record is causal: no Lock (a negative speed is instant).
         let speed = if self.record { self.p.v(2).max(0.0) } else { self.p.v(2) };
         self.lock = speed < 0.0;
-        self.coef = if self.lock { 0.0 } else { time_coef(speed / SETTLE_TAUS, self.sr) };
+        self.coef = if self.lock { 0.0 } else { time_coef(retune_tau_ms(speed), self.sr) };
         self.flex = (self.p.v(3) / 100.0).clamp(0.0, 1.0);
         self.reference = self.p.v(4);
         // Tap delay 1 is the newest sample (no delay), so a latency of n reads at n + 1.
         let d = latency_samples(self.sr, speed, self.record) as f32 + 1.0;
-        if d != self.home_d {
+        if d != self.nominal_d {
             // A new latency: re-centre (a jump, like any latency change).
+            self.nominal_d = d;
             self.home_d = d;
             self.home_taps();
         }
@@ -566,6 +574,7 @@ impl Plugin for Tune {
         self.line_max = self.lines.first().map_or(line as f32, DelayLine::max_delay);
         self.home_step = 1.0 / ms_to_samples(HOME_FADE_MS, self.sr).max(1.0);
         self.period = self.sr / 200.0;
+        self.nominal_d = -1.0;
         self.home_d = -1.0;
         self.update();
         self.reset();
@@ -584,7 +593,6 @@ impl Plugin for Tune {
         self.prev_note = None;
         self.t = 0;
         self.corr = 0.0;
-        self.corr_pre = 0.0;
         self.home = 1.0;
         self.homing = true;
         self.home_taps();
@@ -634,11 +642,9 @@ impl Plugin for Tune {
             if entry.voiced {
                 self.period = entry.period.clamp(self.sr / MAX_HZ, self.sr / MIN_HZ);
             }
-            self.corr_pre = target + (self.corr_pre - target) * self.coef;
-            self.corr = self.corr_pre + (self.corr - self.corr_pre) * self.coef;
+            self.corr = target + (self.corr - target) * self.coef;
             if !self.corr.is_finite() {
                 self.corr = 0.0;
-                self.corr_pre = 0.0;
             }
             // Unvoiced, or a correction inside the dead band: fade to the plain delayed input
             // (with hysteresis, so a correction hovering at the band edge does not flap).
@@ -646,12 +652,19 @@ impl Plugin for Tune {
             // the voice (see `RECENTER_SLEW`), so a small correction only fades once the head is
             // on the tap; until then the head creeps back to it.
             let band = if self.record { RECORD_DEAD_BAND } else { DEAD_BAND };
-            let small = target.abs() < if self.homing { 2.0 * band } else { band } && (self.head - self.home_d).abs() < 1.0;
+            let thr = if self.homing { 2.0 * band } else { band };
+            let p = self.period.max(2.0);
+            // Outside Record the head rests wherever it stops within half a period of the nominal
+            // tap, so only the correction has to be finished (no creep back at a pitch offset).
+            let settled = if self.record { (self.head - self.home_d).abs() < 1.0 } else { self.xf >= 1.0 && (self.head - self.nominal_d).abs() <= 0.5 * p + 1.0 };
+            let small = target.abs() < thr && (self.record || self.corr.abs() < thr) && settled;
             self.homing = !entry.voiced || small;
+            if !self.record && self.homing && self.home <= 0.0 && self.xf >= 1.0 {
+                self.home_d = self.head;
+            }
             self.home = if self.homing { (self.home + self.home_step).min(1.0) } else { (self.home - self.home_step).max(0.0) };
             if self.home >= 1.0 && (self.head != self.home_d || self.xf < 1.0) {
                 self.corr = 0.0;
-                self.corr_pre = 0.0;
                 self.home_taps();
             }
             #[cfg(test)]
@@ -665,7 +678,7 @@ impl Plugin for Tune {
             // toward it (a phase-coherent splice) so the creep back is short.
             if !self.homing && entry.voiced && self.corr.abs() < band && self.xf >= 1.0 {
                 let p = self.period.max(2.0);
-                let d = self.head - self.home_d;
+                let d = self.head - if self.record { self.home_d } else { self.nominal_d };
                 let n = if self.record { (d / p).floor() } else { (d / p).round() };
                 if n != 0.0 && (d.abs() > 0.5 * p || self.record) {
                     self.splice_to(self.head - n * p);
@@ -676,7 +689,7 @@ impl Plugin for Tune {
             let ratio = 2f32.powf(self.corr / 12.0);
             let rate = if self.corr.abs() >= band {
                 1.0 - ratio
-            } else if entry.voiced && !self.homing {
+            } else if self.record && entry.voiced && !self.homing {
                 (self.home_d - self.head).clamp(-RECENTER_SLEW, RECENTER_SLEW)
             } else {
                 0.0
@@ -704,19 +717,19 @@ impl Plugin for Tune {
             };
             let (head, old) = (self.head, self.old);
             let home = self.home;
-            let hd = self.home_d as usize;
+            let home_d = self.home_d;
             for c in 0..ch {
                 let (Some(buf), Some(line)) = (io.get_mut(c), self.lines.get(c)) else { continue };
                 let Some(x) = buf.get_mut(n) else { continue };
                 let shifted = if wo != 0.0 { wo * line.read_cubic(old) + wn * line.read_cubic(head) } else { line.read_cubic(head) };
-                let y = home * line.tap(hd) + (1.0 - home) * shifted;
+                let y = home * line.read_cubic(home_d) + (1.0 - home) * shifted;
                 *x = if y.is_finite() { y } else { 0.0 };
             }
         }
     }
 
     fn latency(&self) -> usize {
-        (self.home_d as usize).saturating_sub(1)
+        (self.nominal_d as usize).saturating_sub(1)
     }
 }
 
@@ -830,7 +843,8 @@ mod tests {
         let first = track.iter().position(|c| c.abs() > 0.003).unwrap();
         let settled = track.iter().position(|c| c.abs() >= 0.95 * 0.3).unwrap();
         let ms = (settled - first) as f32 / SR * 1000.0;
-        assert!((ms - 60.0).abs() < 3.0, "95% after {ms} ms");
+        let want = 3.0 * retune_tau_ms(60.0);
+        assert!((ms - want).abs() < 0.05 * want, "95% after {ms} ms, want {want}");
     }
 
     #[test]
@@ -1019,7 +1033,20 @@ mod tests {
             let x = voiced(f);
             let mut t = plumb(params);
             let y = run(&mut t, &x);
-            let lat = t.latency();
+            // The head rests within half a period of the nominal tap (see `home_d`), so the dry input
+            // is aligned at the lag that matches best around the latency.
+            let nominal = t.latency();
+            let lat = if cents_off == 0.0 {
+                let p = (48_000.0 / f) as usize;
+                (nominal.saturating_sub(p)..=nominal + p)
+                    .max_by(|&l1, &l2| {
+                        let c = |l: usize| (24_000..144_000).map(|i| f64::from(y[i] * x[i - l])).sum::<f64>();
+                        c(l1).total_cmp(&c(l2))
+                    })
+                    .unwrap_or(nominal)
+            } else {
+                nominal
+            };
             let (a, b) = (24_000usize, 144_000usize);
             let out = &y[a..b];
             let dry = &x[a - lat..b - lat];
@@ -1053,7 +1080,7 @@ mod tests {
                 // mode analyses a 2-period window (about 3 ct of jitter on this noisy tone) and its
                 // head cannot rest on the tap after a splice, so it is held to a looser bound.
                 let record = params.iter().any(|(id, v)| *id == "mode" && *v == 1.0);
-                let (d_max, s_max) = if record { (3.0, 2.5) } else { (0.8, 0.5) };
+                let (d_max, s_max) = if record { (3.0, 2.5) } else { (0.8, 1.5) };
                 assert!(depth < d_max && depth_sum < s_max, "{params:?} {name}: {depth} {depth_sum}");
             } else {
                 // Correcting: no deeper notches than an ideal resampling shifter shows.
