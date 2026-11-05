@@ -14,6 +14,8 @@ Three small Windows VST3 plugins sharing one editor and one DSP crate. Free, MIT
 <img src="docs/grit-ui.png" width="400" alt="Grit">
 </p>
 
+See [Plumb vs the competition](docs/vs-competition.md) for measured comparisons.
+
 ## Install
 
 1. Download an `.msi` from the [latest release](../../releases/latest) and run it (needs admin). Each installs one plugin to `C:\Program Files\Common Files\VST3\<Name>.vst3`.
