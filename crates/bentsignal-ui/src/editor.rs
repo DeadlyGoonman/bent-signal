@@ -21,7 +21,7 @@ use windows_sys::Win32::Graphics::Gdi::*;
 use windows_sys::Win32::System::LibraryLoader::{
     GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS, GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT, GetModuleHandleExW,
 };
-use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
 const TIMER_ID: usize = 1;
@@ -288,6 +288,7 @@ impl IPlugViewTrait for View {
             return kResultFalse;
         }
         let win = Box::new(Win {
+            typing: None,
             spec: self.spec,
             shared: self.shared.clone(),
             frame: self.frame.clone(),
@@ -375,7 +376,16 @@ enum Drag {
     Grip { x0: i32, y0: i32, w0: i32, h0: i32 },
 }
 
+/// A number box being typed into.
+struct Typing {
+    index: usize,
+    text: String,
+    /// Nothing typed yet: the first character replaces the shown value.
+    fresh: bool,
+}
+
 pub struct Win {
+    typing: Option<Typing>,
     spec: &'static UiSpec,
     shared: Arc<Shared>,
     frame: Rc<Cell<usize>>,
@@ -512,6 +522,15 @@ fn click(hwnd: HWND, w: &mut Win, x: i32, y: i32, keys: usize, double: bool) {
                 edit(s, q.id, spec.model.to_normalized(q.id, v));
             }
         }
+        Some(Hit::Number(i)) => {
+            if let Some(n) = spec.numbers.get(i) {
+                let plain = spec.model.to_plain(n.id, s.get(n.id));
+                let text = format!("{plain:.1}");
+                w.typing = Some(Typing { index: i, text, fresh: true });
+                // SAFETY: our window; keyboard focus lets it receive the typed characters.
+                unsafe { SetFocus(hwnd) };
+            }
+        }
         // The dropdown menu is modal: `wndproc` shows it.
         Some(Hit::Dropdown(_)) => {}
         Some(Hit::Toggle(i)) => {
@@ -620,6 +639,17 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
         return unsafe { DefWindowProcW(hwnd, msg, wp, lp) };
     }
     if matches!(msg, WM_LBUTTONDOWN | WM_LBUTTONDBLCLK) {
+        {
+            let (x, y) = xy(lp);
+            let (cw, ch) = client_size(hwnd);
+            // SAFETY: see above; short borrow.
+            let w = unsafe { &mut *ptr };
+            let on_box = layout::hit(&layout::layout(w.spec, cw, ch), x, y);
+            if w.typing.as_ref().is_some_and(|t| on_box != Some(Hit::Number(t.index))) {
+                finish_typing(w, true);
+                invalidate(hwnd);
+            }
+        }
         let (x, y) = xy(lp);
         // SAFETY: see above; this borrow ends before the modal menu below can re-enter.
         let menu = preset_menu(hwnd, unsafe { &mut *ptr }, x, y);
@@ -656,6 +686,16 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     // SAFETY: as above (no handler below re-enters the window procedure).
     let w = unsafe { &mut *ptr };
     match msg {
+        WM_GETDLGCODE if w.typing.is_some() => (DLGC_WANTCHARS | DLGC_WANTALLKEYS) as LRESULT,
+        WM_CHAR => {
+            type_char(hwnd, w, wp as u32);
+            0
+        }
+        WM_KILLFOCUS => {
+            finish_typing(w, true);
+            invalidate(hwnd);
+            0
+        }
         WM_TIMER => {
             flush_restart(&w.shared);
             let meter = w.shared.meter().to_bits();
@@ -1034,6 +1074,19 @@ fn draw(g: &Gdi, l: &Layout, w: &Win) {
         g.polyline(&[(ax - u(4.0), ay - u(2.0)), (ax, ay + u(2.0)), (ax + u(4.0), ay - u(2.0))], p().text, u(1.4));
     }
 
+    // Number boxes (typed values).
+    for (i, (nb, ns)) in l.numbers.iter().zip(spec.numbers.iter()).enumerate() {
+        let typing = w.typing.as_ref().filter(|t| t.index == i);
+        let hot = typing.is_some() || w.hover == Some(Hit::Number(i));
+        g.boxed(&nb.rect, p().btn, if hot { p().rust } else { p().btn_edge }, u(1.0));
+        g.text(&nb.caption, ns.caption, f.small, p().dim, CENTER);
+        let shown = match typing {
+            Some(t) => format!("{}{}", t.text, if t.fresh { "" } else { "|" }),
+            None => format!("{:.1}", spec.model.to_plain(ns.id, sh.get(ns.id))),
+        };
+        g.text(&nb.value, &shown, f.label, p().text, CENTER);
+    }
+
     // Dividers.
     for r in &l.rules {
         g.fill(&Rect::new(r.left, r.top, r.right, r.top + u(1.0)), p().btn_edge);
@@ -1316,4 +1369,48 @@ pub fn capture_png(shared: Arc<Shared>, spec: &'static UiSpec, hover: Option<Hit
         }
     }
     Ok(())
+}
+
+/// Applies (or drops) the number being typed: the text is the parameter's plain value.
+fn finish_typing(w: &mut Win, apply: bool) {
+    let Some(t) = w.typing.take() else { return };
+    if !apply {
+        return;
+    }
+    let (Some(n), Ok(v)) = (w.spec.numbers.get(t.index), t.text.trim().parse::<f64>()) else { return };
+    if v.is_finite() {
+        edit(&w.shared, n.id, w.spec.model.to_normalized(n.id, v));
+    }
+}
+
+/// A character typed into the number box: digits, a point, a minus; Backspace, Enter, Esc.
+fn type_char(hwnd: HWND, w: &mut Win, c: u32) {
+    let Some(t) = w.typing.as_mut() else { return };
+    match c {
+        13 => finish_typing(w, true),
+        27 => finish_typing(w, false),
+        8 => {
+            if t.fresh {
+                t.text.clear();
+                t.fresh = false;
+            } else {
+                t.text.pop();
+            }
+        }
+        _ => {
+            let ch = match char::from_u32(c) {
+                Some(',') => '.',
+                Some(ch) if ch.is_ascii_digit() || ch == '.' || ch == '-' => ch,
+                _ => return,
+            };
+            if t.fresh {
+                t.text.clear();
+                t.fresh = false;
+            }
+            if t.text.len() < 8 {
+                t.text.push(ch);
+            }
+        }
+    }
+    invalidate(hwnd);
 }

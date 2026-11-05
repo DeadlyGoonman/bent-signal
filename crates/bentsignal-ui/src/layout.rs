@@ -98,6 +98,14 @@ pub struct Dropdown {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
+pub struct NumberBox {
+    pub id: u32,
+    pub rect: Rect,
+    pub caption: Rect,
+    pub value: Rect,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Radio {
     pub id: u32,
     pub value: f64,
@@ -145,6 +153,7 @@ pub struct Layout {
     pub knobs: Vec<Knob>,
     pub toggles: Vec<Toggle>,
     pub dropdowns: Vec<Dropdown>,
+    pub numbers: Vec<NumberBox>,
     pub radios: Vec<Radio>,
     pub selector: Option<Selector>,
     pub labels: Vec<(Rect, &'static str)>,
@@ -168,6 +177,8 @@ pub enum Hit {
     Toggle(usize),
     /// A dropdown, by index in `UiSpec::dropdowns`.
     Dropdown(usize),
+    /// A number box, by index in `UiSpec::numbers`.
+    Number(usize),
     /// A radio button, by index in `UiSpec::radios`.
     Radio(usize),
     Knob(u32),
@@ -243,6 +254,11 @@ pub fn layout(spec: &UiSpec, w: i32, h: i32) -> Layout {
             arrow: r(d.x1 - 26, d.y0, d.x1 - 6, d.y1),
         })
         .collect();
+    let numbers = spec
+        .numbers
+        .iter()
+        .map(|n| NumberBox { id: n.id, rect: r(n.x0, n.y0, n.x1, n.y1), caption: r(n.x0, n.y0 + 3, n.x1, n.y0 + 19), value: r(n.x0, n.y0 + 19, n.x1, n.y1 - 3) })
+        .collect();
     let radios = spec
         .radios
         .iter()
@@ -292,6 +308,7 @@ pub fn layout(spec: &UiSpec, w: i32, h: i32) -> Layout {
         knobs,
         toggles,
         dropdowns,
+        numbers,
         radios,
         selector,
         labels,
@@ -307,6 +324,7 @@ impl Layout {
         let mut v = vec![self.prev, self.next, self.name, self.save, self.reset, self.bypass];
         v.extend(self.toggles.iter().map(|t| t.hit));
         v.extend(self.dropdowns.iter().map(|d| d.rect));
+        v.extend(self.numbers.iter().map(|n| n.rect));
         v.extend(self.radios.iter().map(|q| q.hit));
         if let Some(s) = &self.selector {
             v.extend(s.buttons.iter().copied());
@@ -335,6 +353,9 @@ pub fn hit(l: &Layout, x: i32, y: i32) -> Option<Hit> {
     }
     if let Some(i) = l.dropdowns.iter().position(|d| d.rect.contains(x, y)) {
         return Some(Hit::Dropdown(i));
+    }
+    if let Some(i) = l.numbers.iter().position(|n| n.rect.contains(x, y)) {
+        return Some(Hit::Number(i));
     }
     if let Some(i) = l.radios.iter().position(|q| q.hit.contains(x, y)) {
         return Some(Hit::Radio(i));
@@ -386,6 +407,7 @@ pub fn tooltip(spec: &UiSpec, h: Hit) -> &'static str {
         Hit::Option(i) => spec.selector.and_then(|s| s.options.get(i)).map_or("", |o| o.tip),
         Hit::Dropdown(i) => spec.dropdowns.get(i).map_or("", |d| spec.model.tip(d.id)),
         Hit::Radio(i) => spec.radios.get(i).map_or("", |q| q.tip),
+        Hit::Number(i) => spec.numbers.get(i).map_or("", |n| spec.model.tip(n.id)),
         Hit::Toggle(i) => spec.toggles.get(i).map_or("", |t| spec.model.tip(t.id)),
         Hit::Knob(id) => spec.model.tip(id),
         Hit::Meter => spec.meter.map_or("", |m| m.tip),
@@ -469,6 +491,7 @@ mod tests {
             ],
         }),
         dropdowns: &[],
+        numbers: &[],
         radios: &[],
         labels: &[],
         rules: &[],

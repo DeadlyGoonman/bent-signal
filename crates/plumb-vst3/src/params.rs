@@ -292,7 +292,7 @@ pub fn tip(id: u32) -> &'static str {
             "Retune Speed: how long the move to the target note takes, 0 to 400 ms (0 is instant). Below 0 is Lock: the audio is delayed a little more so each new note is on target from its first moment."
         }
         3 => "Flex Tune: how much of the singer's own deviation from the note is kept. 0% snaps hard; 100% leaves the pitch as sung.",
-        4 => "Reference: the frequency of A4, 430 to 450 Hz. Every target note is tuned from it.",
+        4 => "Reference: the frequency of A4, 420 to 460 Hz. Every target note is tuned from it.",
         5 => {
             "Mode: Normal (20 ms latency, or Lock) or Record, which tunes with under 1 ms latency for monitoring while you record (no Lock; a little rougher on low voices)."
         }
@@ -371,7 +371,7 @@ mod tests {
         assert_eq!(format(SPEED, 1.0), "Lock 3.0 ms");
         assert_eq!(format(SPEED, to_normalized(SPEED, 0.0)), "Instant");
         assert_eq!(format(SPEED, default_normalized(SPEED)), "20.0 ms");
-        assert_eq!(format(REFERENCE, 0.0), "430.0 Hz");
+        assert_eq!(format(REFERENCE, 0.0), "420.0 Hz");
         assert_eq!(parse(SCALE, "blues"), Some(1.0));
         assert_eq!(parse(KEY, "c#"), Some(to_normalized(KEY, 1.0)));
         assert_eq!(parse(KEY, "Db"), Some(to_normalized(KEY, 1.0)));

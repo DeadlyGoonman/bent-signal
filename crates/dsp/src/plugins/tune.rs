@@ -128,7 +128,7 @@ static TUNE_PARAMS: [ParamInfo; 6] = [
     choice("scale", "Scale", &SCALES, 1),
     lin("speed", "Retune Speed", SPEED_MIN_MS, SPEED_MAX_MS, 20.0, Unit::Ms),
     lin("flex", "Flex Tune", 0.0, 100.0, 0.0, Unit::Percent),
-    lin("reference", "Reference", 430.0, 450.0, 440.0, Unit::Hz),
+    lin("reference", "Reference", 420.0, 460.0, 440.0, Unit::Hz),
     choice("mode", "Mode", &MODES, 0),
 ];
 

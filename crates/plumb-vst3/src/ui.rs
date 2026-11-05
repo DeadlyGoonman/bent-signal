@@ -1,12 +1,12 @@
 //! Plumb's description for the shared Bent Signal editor, laid out as drawn on a portrait 9:16
 //! canvas (360 x 640), top to bottom: the key dropdown with the Major / Minor radios on one row,
 //! the big Retune knob, a divider, the small Flex knob beside the Low Lat checkbox, and the Link
-//! row of five large dots. Dark grey theme. The A4 reference and the other scales have no control
+//! row of five large dots. Dark grey theme. The A4 reference is a typed box beside Retune; the other scales have no control
 //! here (they stay on the host's parameter list); the editor draws and handles input in
 //! `bentsignal-ui`.
 
-use crate::params::{self, BYPASS, FLEX, KEY, KEY_NAMES, MODE, MODEL, PRESETS, SCALE, SPEED, SYNC};
-use bentsignal_ui::{DropdownSpec, Glyph, KnobSpec, LabelSpec, RadioSpec, RuleSpec, Theme, ToggleSpec, UiSpec};
+use crate::params::{self, BYPASS, FLEX, KEY, KEY_NAMES, MODE, MODEL, PRESETS, REFERENCE, SCALE, SPEED, SYNC};
+use bentsignal_ui::{DropdownSpec, Glyph, KnobSpec, LabelSpec, NumberSpec, RadioSpec, RuleSpec, Theme, ToggleSpec, UiSpec};
 
 const BASE_W: i32 = 360;
 const BASE_H: i32 = 640;
@@ -38,7 +38,11 @@ static RADIOS: [RadioSpec; 7] = [
 
 static LABELS: [LabelSpec; 1] = [LabelSpec { text: "LINK", cx: 180, cy: 532 }];
 
-static RULES: [RuleSpec; 1] = [RuleSpec { x0: 20, x1: 340, y: 318 }];
+/// The divider under the knobs and the one over the Link row.
+static RULES: [RuleSpec; 2] = [RuleSpec { x0: 20, x1: 340, y: 318 }, RuleSpec { x0: 20, x1: 340, y: 508 }];
+
+/// The A4 reference as a typed box, bottom right of the top panel beside Retune.
+static NUMBERS: [NumberSpec; 1] = [NumberSpec { id: REFERENCE, caption: "A4 Hz", x0: 262, y0: 252, x1: 340, y1: 298 }];
 
 /// Low Lat is the Mode list shown as a checkbox: checked is Record.
 static TOGGLES: [ToggleSpec; 1] =
@@ -53,6 +57,7 @@ pub static SPEC: UiSpec = UiSpec {
     toggles: &TOGGLES,
     selector: None,
     dropdowns: &DROPDOWNS,
+    numbers: &NUMBERS,
     radios: &RADIOS,
     labels: &LABELS,
     rules: &RULES,
@@ -75,7 +80,7 @@ mod tests {
         let l = layout::layout(&SPEC, BASE_W, BASE_H);
         assert_eq!(l.toggles.len(), 1);
         assert_eq!(l.knobs.len(), 2);
-        assert_eq!((l.dropdowns.len(), l.radios.len(), l.labels.len(), l.rules.len()), (1, 7, 1, 1));
+        assert_eq!((l.dropdowns.len(), l.numbers.len(), l.radios.len(), l.labels.len(), l.rules.len()), (1, 1, 7, 1, 2));
         assert!(l.selector.is_none());
         assert_eq!(layout::default_size(&SPEC), (360, 640), "9:16");
         assert_eq!(layout::min_size(&SPEC), (270, 480));
@@ -86,11 +91,12 @@ mod tests {
         let mut ids: Vec<u32> = SPEC.knobs.iter().map(|k| k.id).collect();
         ids.extend(SPEC.toggles.iter().map(|t| t.id));
         ids.extend(SPEC.dropdowns.iter().map(|d| d.id));
+        ids.extend(SPEC.numbers.iter().map(|n| n.id));
         ids.extend(SPEC.radios.iter().map(|r| r.id));
         ids.sort_unstable();
         ids.dedup();
-        // Everything but the A4 reference (id 4), which stays on the host's parameter list.
-        assert_eq!(ids, [KEY, SCALE, SPEED, FLEX, MODE, SYNC]);
+        // Every parameter but Bypass.
+        assert_eq!(ids, [KEY, SCALE, SPEED, FLEX, REFERENCE, MODE, SYNC]);
         // Major and Minor are scale values 1 and 2; the dots are the groups 1..=5.
         assert_eq!(soundcraft_dsp::plugins::tune::SCALES[1], "Major");
         assert_eq!(soundcraft_dsp::plugins::tune::SCALES[2], "Minor");

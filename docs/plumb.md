@@ -16,7 +16,7 @@ Plumb is a realtime, monophonic pitch corrector (vocals, lead lines, any single 
 | Flex | How much of the singer's own pitch drift is kept. 0 snaps hard, 100 leaves the pitch as sung. |
 | Low Lat | Record mode: tunes with under 1 ms latency so you can monitor through it while recording (a little rougher on low voices, no Lock). |
 | Link | Five dots. Plumbs on the same dot share key, scale, retune, flex and mode. Click a lit dot to unlink. Works between Plumbs in the same host process. |
-| A4 reference | 430-450 Hz, on the host's parameter list. |
+| A4 Hz | Typed box beside Retune (click, type, Enter): the tuning reference, 420-460 Hz. |
 
 Latency is 20 ms in Normal mode (more in Lock), under 1 ms in Low Lat. The editor resizes (drag the corner) and remembers its size.
 

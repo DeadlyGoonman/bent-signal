@@ -43,6 +43,7 @@ pub static SPEC: UiSpec = UiSpec {
     toggles: &TOGGLES,
     selector: Some(SelectorSpec { id: STYLE, caption: "STYLE", cx: 320, cy: 350, spacing: 40, options: &STYLES }),
     dropdowns: &[],
+    numbers: &[],
     radios: &[],
     labels: &[],
     rules: &[],

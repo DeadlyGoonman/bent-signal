@@ -110,6 +110,18 @@ pub struct DropdownSpec {
     pub options: &'static [&'static str],
 }
 
+/// A box showing a number (the parameter's plain value, with its unit) that is edited by typing:
+/// click, type, Enter to apply, Esc to cancel.
+#[derive(Debug, Clone, Copy)]
+pub struct NumberSpec {
+    pub id: u32,
+    pub caption: &'static str,
+    pub x0: i32,
+    pub y0: i32,
+    pub x1: i32,
+    pub y1: i32,
+}
+
 /// A radio button: lit while the parameter `id` has the plain value `value`; clicking sets it.
 #[derive(Debug, Clone, Copy)]
 pub struct RadioSpec {
@@ -176,6 +188,7 @@ pub struct UiSpec {
     pub toggles: &'static [ToggleSpec],
     pub selector: Option<SelectorSpec>,
     pub dropdowns: &'static [DropdownSpec],
+    pub numbers: &'static [NumberSpec],
     pub radios: &'static [RadioSpec],
     pub labels: &'static [LabelSpec],
     pub rules: &'static [RuleSpec],

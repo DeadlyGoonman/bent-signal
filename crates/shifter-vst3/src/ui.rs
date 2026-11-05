@@ -35,6 +35,7 @@ pub static SPEC: UiSpec = UiSpec {
     toggles: &TOGGLES,
     selector: Some(SelectorSpec { id: params::MODE, caption: "MODE", cx: 320, cy: 150, spacing: 50, options: &MODES }),
     dropdowns: &[],
+    numbers: &[],
     radios: &[],
     labels: &[],
     rules: &[],
