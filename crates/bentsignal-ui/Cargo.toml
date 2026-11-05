@@ -1,0 +1,31 @@
+[package]
+name = "bentsignal-ui"
+description = "Bent Signal house UI: one Win32/GDI editor, layout grid, palette and widgets shared by every Bent Signal VST3 plugin (an isolated unsafe FFI crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+[features]
+# `capture_png`: renders the editor off-screen to a PNG (tests and screenshots).
+capture = ["dep:image"]
+
+[dependencies]
+vst3 = "0.3"
+image = { workspace = true, optional = true }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_Graphics_Gdi", "Win32_Storage_Xps", "Win32_System_LibraryLoader", "Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging"] }
+
+# Isolated unsafe crate (like shifter-vst3): unsafe is denied crate-wide and allowed only on the
+# host-handler module (`host`) and the Win32 editor (`editor`).
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"

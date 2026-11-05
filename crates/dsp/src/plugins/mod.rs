@@ -3,6 +3,7 @@
 pub mod drums;
 pub mod dynamics;
 pub mod eq;
+pub mod grit;
 pub mod harmonic;
 pub mod modulation;
 pub mod pitch;
@@ -12,6 +13,7 @@ pub mod shifter;
 pub mod stock;
 pub mod strip;
 pub mod synth;
+pub mod tune;
 pub mod utility;
 
 use crate::{Plugin, PluginInfo};
@@ -38,10 +40,12 @@ pub(crate) static REGISTRY: &[&PluginInfo] = &[
     &stock::PHASER_INFO,
     &stock::DVERB_INFO,
     &harmonic::SAT_INFO,
+    &grit::GRIT_INFO,
     &harmonic::LOFI_INFO,
     &harmonic::RECT_INFO,
     &pitch::PITCH_INFO,
     &shifter::SHIFTER_INFO,
+    &tune::TUNE_INFO,
     &utility::SHIFT_INFO,
     &utility::GAIN_INFO,
     &utility::TRIM_INFO,
@@ -76,11 +80,13 @@ pub(crate) fn instantiate(id: &str) -> Option<Box<dyn Plugin>> {
         "stock_ensemble" => Box::new(stock::Ensemble::new()),
         "stock_phaser" => Box::new(stock::Phaser::new()),
         "stock_dverb" => Box::new(stock::DVerb::new()),
+        "grit" => Box::new(grit::Grit::new()),
         "saturator" => Box::new(harmonic::Saturator::new()),
         "lofi" => Box::new(harmonic::LoFi::new()),
         "rectifier" => Box::new(harmonic::Rectifier::new()),
         "pitch_shifter" => Box::new(pitch::PitchShifter::new()),
         "shifter" => Box::new(shifter::Shifter::new()),
+        "plumb" => Box::new(tune::Tune::new()),
         "time_shift" => Box::new(utility::TimeShift::new()),
         "gain" => Box::new(utility::Gain::new()),
         "trim" => Box::new(utility::Trim::new()),

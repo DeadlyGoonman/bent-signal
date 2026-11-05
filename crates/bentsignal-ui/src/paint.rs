@@ -51,9 +51,32 @@ pub fn wood_runs(seed: u32, line: usize, count: usize) -> Vec<(f32, f32, [u8; 3]
         .collect()
 }
 
+/// Linear level to dBFS (floored at -120).
+pub fn level_db(peak: f32) -> f32 {
+    if peak.is_finite() && peak > 1e-6 { 20.0 * peak.log10() } else { -120.0 }
+}
+
+/// Position of `db` along a meter from `floor` to `ceil`, 0..1.
+pub fn meter_fraction(db: f32, floor: f32, ceil: f32) -> f32 {
+    if !db.is_finite() || ceil <= floor {
+        return 0.0;
+    }
+    clamp01((db - floor) / (ceil - floor))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn meter_maps_db_to_a_fraction() {
+        assert_eq!(meter_fraction(-48.0, -48.0, 0.0), 0.0);
+        assert_eq!(meter_fraction(-24.0, -48.0, 0.0), 0.5);
+        assert_eq!(meter_fraction(6.0, -48.0, 0.0), 1.0);
+        assert_eq!(meter_fraction(f32::NAN, -48.0, 0.0), 0.0);
+        assert_eq!(level_db(0.0), -120.0);
+        assert!((level_db(0.5) + 6.02).abs() < 0.01);
+    }
 
     #[test]
     fn wood_is_deterministic_and_covers_the_line() {

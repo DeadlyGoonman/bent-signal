@@ -7,15 +7,17 @@
 //! through `Shared` atomics (whole states) and the host's parameter queues (edits, automation).
 
 use crate::params::{self, BYPASS, PARAM_COUNT, STATE_HEADER, Shared};
+pub use bentsignal_ui::host::{copy_c8, copy_c16};
+use bentsignal_ui::host::set_handler;
 use soundcraft_dsp::Plugin;
 use soundcraft_dsp::plugins::shifter::Shifter;
 use std::cell::UnsafeCell;
-use std::ffi::{CStr, c_char, c_void};
+use std::ffi::{CStr, c_void};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use vst3::Steinberg::Vst::*;
 use vst3::Steinberg::*;
-use vst3::{Class, ComPtr, ComRef, ComWrapper, uid};
+use vst3::{Class, ComRef, ComWrapper, uid};
 
 /// The Shifter audio module's class id (fixed forever: hosts store it in their sessions).
 pub const SHIFTER_CID: TUID = uid(0x6A1F3C29, 0x4E8B4D17, 0x9C52A0B3, 0x5D7E61F4);
@@ -27,80 +29,6 @@ pub const SUB_CATEGORIES: &str = "Fx|Pitch Shift";
 const MAX_QUEUES: usize = 32;
 /// Largest block the processor prepares for, whatever the host says.
 const MAX_BLOCK_CAP: usize = 1 << 16;
-
-pub(crate) fn copy_c8(src: &str, dst: &mut [c_char]) {
-    let n = dst.len().saturating_sub(1);
-    let mut i = 0;
-    for (d, s) in dst.iter_mut().zip(src.bytes()).take(n) {
-        *d = s as c_char;
-        i += 1;
-    }
-    if let Some(z) = dst.get_mut(i) {
-        *z = 0;
-    }
-}
-
-pub(crate) fn copy_c16(src: &str, dst: &mut [TChar]) {
-    let n = dst.len().saturating_sub(1);
-    let mut i = 0;
-    for (d, s) in dst.iter_mut().zip(src.encode_utf16()).take(n) {
-        *d = s as TChar;
-        i += 1;
-    }
-    if let Some(z) = dst.get_mut(i) {
-        *z = 0;
-    }
-}
-
-// ---- host edits (UI thread) ----------------------------------------------------------------
-
-fn with_handler(shared: &Shared, f: impl FnOnce(ComRef<'_, IComponentHandler>)) {
-    let p = shared.handler.load(Ordering::Acquire) as *mut IComponentHandler;
-    // SAFETY: a non-zero address is an AddRef'd handler from `setComponentHandler`, released only
-    // on the UI thread (terminate / replace / drop), the thread edits come from.
-    if let Some(h) = unsafe { ComRef::from_raw(p) } {
-        f(h);
-    }
-}
-
-pub(crate) fn begin_edit(shared: &Shared, id: u32) {
-    // SAFETY: a valid handler (see `with_handler`).
-    with_handler(shared, |h| unsafe {
-        h.beginEdit(id);
-    });
-}
-
-/// Sets the value locally (the editor follows at once) and tells the host.
-pub(crate) fn perform_edit(shared: &Shared, id: u32, n: f64) {
-    shared.set(id, n);
-    let n = shared.get(id);
-    // SAFETY: a valid handler (see `with_handler`).
-    with_handler(shared, |h| unsafe {
-        h.performEdit(id, n);
-    });
-}
-
-pub(crate) fn end_edit(shared: &Shared, id: u32) {
-    // SAFETY: a valid handler (see `with_handler`).
-    with_handler(shared, |h| unsafe {
-        h.endEdit(id);
-    });
-}
-
-/// A complete one-shot edit (a click on a button or a menu choice).
-pub(crate) fn edit(shared: &Shared, id: u32, n: f64) {
-    begin_edit(shared, id);
-    perform_edit(shared, id, n);
-    end_edit(shared, id);
-}
-
-fn set_handler(shared: &Shared, handler: *mut IComponentHandler) {
-    // SAFETY: the host hands a valid handler or null; we keep our own reference.
-    let new = unsafe { ComRef::from_raw(handler) }.map(|h| h.to_com_ptr().into_raw() as usize).unwrap_or(0);
-    let old = shared.handler.swap(new, Ordering::AcqRel) as *mut IComponentHandler;
-    // SAFETY: `old` was AddRef'd by us (or is null); this releases that reference.
-    drop(unsafe { ComPtr::from_raw(old) });
-}
 
 // ---- processor -----------------------------------------------------------------------------
 
@@ -288,7 +216,7 @@ pub struct ShifterPlugin {
 
 impl ShifterPlugin {
     pub fn new() -> Self {
-        ShifterPlugin { shared: Arc::new(Shared::new()), engine: UnsafeCell::new(Engine::new()) }
+        ShifterPlugin { shared: Arc::new(params::new_shared()), engine: UnsafeCell::new(Engine::new()) }
     }
 
     /// The processor state. Only the processing calls use it, never two at once (VST3 contract).
@@ -313,7 +241,8 @@ impl Default for ShifterPlugin {
 
 impl Drop for ShifterPlugin {
     fn drop(&mut self) {
-        set_handler(&self.shared, std::ptr::null_mut());
+        // SAFETY: null clears the handler; the UI thread owns it.
+        unsafe { set_handler(&self.shared, std::ptr::null_mut()) };
     }
 }
 
@@ -367,7 +296,8 @@ impl IPluginBaseTrait for ShifterPlugin {
         kResultOk
     }
     unsafe fn terminate(&self) -> tresult {
-        set_handler(&self.shared, std::ptr::null_mut());
+        // SAFETY: null clears the handler; the UI thread owns it.
+        unsafe { set_handler(&self.shared, std::ptr::null_mut()) };
         kResultOk
     }
 }
@@ -632,7 +562,8 @@ impl IEditControllerTrait for ShifterPlugin {
         if self.shared.set(id, v) { kResultOk } else { kInvalidArgument }
     }
     unsafe fn setComponentHandler(&self, handler: *mut IComponentHandler) -> tresult {
-        set_handler(&self.shared, handler);
+        // SAFETY: the host hands a valid handler or null.
+        unsafe { set_handler(&self.shared, handler) };
         kResultOk
     }
     unsafe fn createView(&self, name: FIDString) -> *mut IPlugView {
@@ -645,7 +576,7 @@ impl IEditControllerTrait for ShifterPlugin {
         }
         #[cfg(windows)]
         {
-            crate::editor::create_view(self.shared.clone())
+            bentsignal_ui::editor::create_view(self.shared.clone(), &crate::ui::SPEC)
         }
         #[cfg(not(windows))]
         {
@@ -745,7 +676,7 @@ pub extern "system" fn InitDll() -> bool {
 #[cfg(windows)]
 #[unsafe(no_mangle)]
 pub extern "system" fn ExitDll() -> bool {
-    crate::editor::unregister_class();
+    bentsignal_ui::editor::unregister_class();
     true
 }
 

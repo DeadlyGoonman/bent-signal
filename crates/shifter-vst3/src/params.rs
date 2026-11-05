@@ -2,9 +2,17 @@
 //! mapping), the values shared between the processor, the controller and the editor, the state
 //! blob, factory presets and the editor's hover texts. Safe code only.
 
+use bentsignal_ui::{ParamModel, Preset};
 use soundcraft_dsp::plugins::shifter::SHIFTER_INFO;
 use soundcraft_dsp::{ParamInfo, Unit};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+
+/// The values shared by processor, controller and editor.
+pub type Shared = bentsignal_ui::Shared;
+
+/// A new `Shared` holding the default values.
+pub fn new_shared() -> Shared {
+    Shared::new(&MODEL)
+}
 
 /// VST3 parameter ids 0..=7 are the DSP parameters in table order (mode, delay, detune, anchor,
 /// width, mix, output, phase_swap); 8 is the host bypass.
@@ -143,70 +151,9 @@ pub fn parse(id: u32, text: &str) -> Option<f64> {
     v.is_finite().then(|| to_normalized(id, v))
 }
 
-/// Values shared by the processor (audio thread), the controller and the editor (UI thread):
-/// normalized values as `f64` bits, a generation bumped when a whole state is loaded (the
-/// processor then re-applies every value), a dirty flag for the editor, and the host's component
-/// handler (an AddRef'd `IComponentHandler` address, 0 when none; owned by `plugin`).
-pub struct Shared {
-    norm: [AtomicU64; PARAM_COUNT],
-    pub generation: AtomicU64,
-    pub dirty: AtomicBool,
-    pub handler: AtomicUsize,
-    /// Sample rate (as `f64` bits) of the last `setupProcessing`, for the tail length.
-    pub sample_rate: AtomicU64,
-}
-
-impl Default for Shared {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl Shared {
-    pub fn new() -> Self {
-        Shared {
-            norm: std::array::from_fn(|i| AtomicU64::new(default_normalized(i as u32).to_bits())),
-            generation: AtomicU64::new(0),
-            dirty: AtomicBool::new(true),
-            handler: AtomicUsize::new(0),
-            sample_rate: AtomicU64::new(48_000f64.to_bits()),
-        }
-    }
-
-    pub fn get(&self, id: u32) -> f64 {
-        self.norm.get(id as usize).map(|a| f64::from_bits(a.load(Ordering::Relaxed))).unwrap_or(0.0)
-    }
-
-    /// Stores a normalized value (clamped) and marks the editor dirty. `false` for unknown ids.
-    pub fn set(&self, id: u32, n: f64) -> bool {
-        let Some(slot) = self.norm.get(id as usize) else { return false };
-        let n = if n.is_finite() { n.clamp(0.0, 1.0) } else { 0.0 };
-        slot.store(n.to_bits(), Ordering::Relaxed);
-        self.dirty.store(true, Ordering::Relaxed);
-        true
-    }
-
-    pub fn plain(&self, id: u32) -> f64 {
-        to_plain(id, self.get(id))
-    }
-
-    /// Every value, normalized, in id order.
-    pub fn snapshot(&self) -> [f64; PARAM_COUNT] {
-        std::array::from_fn(|i| self.get(i as u32))
-    }
-
-    /// Replaces every value (a loaded state) and asks the processor to re-apply them.
-    pub fn load(&self, values: &[f64; PARAM_COUNT]) {
-        for (i, v) in values.iter().enumerate() {
-            self.set(i as u32, *v);
-        }
-        self.generation.fetch_add(1, Ordering::Release);
-    }
-}
-
 /// The state blob for normalized `values` (stored as plain values, so a later range change keeps
 /// what the user heard).
-pub fn encode_state(values: &[f64; PARAM_COUNT]) -> Vec<u8> {
+pub fn encode_state(values: &[f64]) -> Vec<u8> {
     let mut out = Vec::with_capacity(STATE_HEADER + 8 * PARAM_COUNT);
     out.extend_from_slice(&STATE_MAGIC);
     out.extend_from_slice(&STATE_VERSION.to_le_bytes());
@@ -252,14 +199,43 @@ pub fn decode_state(bytes: &[u8]) -> Option<[f64; PARAM_COUNT]> {
 }
 
 /// Factory presets: name and plain values for ids 0..=7 (bypass untouched).
-pub const PRESETS: [(&str, [f64; DSP_COUNT]); 6] = [
-    ("Default", [0.0, 12.0, 9.0, 150.0, 100.0, 50.0, 0.0, 0.0]),
-    ("Gentle Double", [0.0, 8.0, 5.0, 150.0, 100.0, 35.0, 0.0, 0.0]),
-    ("Wide Twin", [0.0, 18.0, 14.0, 200.0, 100.0, 60.0, -1.0, 0.0]),
-    ("Slow Drift", [1.0, 15.0, 10.0, 150.0, 100.0, 50.0, 0.0, 0.0]),
-    ("Mono-Safe Spread", [2.0, 20.0, 12.0, 180.0, 100.0, 60.0, 0.0, 0.0]),
-    ("Hollow Swap", [0.0, 14.0, 9.0, 120.0, 100.0, 50.0, 0.0, 1.0]),
+pub static PRESETS: [Preset; 6] = [
+    Preset { name: "Default", values: &[0.0, 12.0, 9.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
+    Preset { name: "Gentle Double", values: &[0.0, 8.0, 5.0, 150.0, 100.0, 35.0, 0.0, 0.0] },
+    Preset { name: "Wide Twin", values: &[0.0, 18.0, 14.0, 200.0, 100.0, 60.0, -1.0, 0.0] },
+    Preset { name: "Slow Drift", values: &[1.0, 15.0, 10.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
+    Preset { name: "Mono-Safe Spread", values: &[2.0, 20.0, 12.0, 180.0, 100.0, 60.0, 0.0, 0.0] },
+    Preset { name: "Hollow Swap", values: &[0.0, 14.0, 9.0, 120.0, 100.0, 50.0, 0.0, 1.0] },
 ];
+
+/// The Shifter's parameters as the shared editor sees them.
+pub struct Model;
+
+pub static MODEL: Model = Model;
+
+impl ParamModel for Model {
+    fn count(&self) -> usize {
+        PARAM_COUNT
+    }
+    fn dsp_count(&self) -> usize {
+        DSP_COUNT
+    }
+    fn to_plain(&self, id: u32, n: f64) -> f64 {
+        to_plain(id, n)
+    }
+    fn to_normalized(&self, id: u32, v: f64) -> f64 {
+        to_normalized(id, v)
+    }
+    fn default_normalized(&self, id: u32) -> f64 {
+        default_normalized(id)
+    }
+    fn format(&self, id: u32, n: f64) -> String {
+        format(id, n)
+    }
+    fn tip(&self, id: u32) -> &'static str {
+        tip(id)
+    }
+}
 
 /// Hover text of each mode option.
 pub const MODE_TIPS: [&str; 3] = [
@@ -392,8 +368,8 @@ mod tests {
 
     #[test]
     fn presets_are_in_range_and_tips_exist() {
-        for (name, p) in PRESETS {
-            for (id, v) in p.iter().enumerate() {
+        for Preset { name, values } in PRESETS.iter() {
+            for (id, v) in values.iter().enumerate() {
                 let n = to_normalized(id as u32, *v);
                 assert!((to_plain(id as u32, n) - v).abs() < 1e-3, "{name} id {id}");
             }

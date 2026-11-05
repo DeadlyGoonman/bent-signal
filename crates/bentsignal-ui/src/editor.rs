@@ -1,17 +1,19 @@
 //! The editor: an `IPlugView` whose Win32 child window (inside the host's `HWND`) is drawn with
 //! GDI, supersampled 2x and scaled down with halftone filtering for smooth knobs. Layout and hit
 //! testing live in `layout`; values in `Shared` (the editor redraws when they change, polled on a
-//! 30 Hz timer through the dirty flag). Edits go to the host through `IComponentHandler`.
+//! 30 Hz timer through the dirty flag). Edits go to the host through `IComponentHandler`
+//! (`host`). One implementation serves every Bent Signal plugin; a `UiSpec` says what to show.
 
+use crate::host::{begin_edit, edit, end_edit, flush_restart, perform_edit};
 use crate::layout::{self, Hit, Knob, Layout, Rect};
 use crate::paint;
-use crate::params::{self, BYPASS, DSP_COUNT, MODE, PARAM_COUNT, PHASE_SWAP, PRESETS, Shared};
-use crate::plugin::{begin_edit, edit, end_edit, perform_edit};
+use crate::shared::Shared;
+use crate::spec::{BUNDLE_NAME, Glyph, SelectorSpec, Theme, UiSpec};
 use std::cell::Cell;
 use std::ffi::{CStr, c_void};
 use std::rc::Rc;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use vst3::Steinberg::*;
 use vst3::{Class, ComRef, ComWrapper};
 use windows_sys::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
@@ -22,7 +24,6 @@ use windows_sys::Win32::System::LibraryLoader::{
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent};
 use windows_sys::Win32::UI::WindowsAndMessaging::*;
 
-const CLASS_NAME: &str = "SoundCraftShifterEditor";
 const TIMER_ID: usize = 1;
 /// Timer ticks (33 ms) of hovering before the tooltip shows.
 const TIP_TICKS: u32 = 14;
@@ -32,27 +33,107 @@ const MK_SHIFT: usize = 0x0004;
 const MK_CONTROL: usize = 0x0008;
 const WM_MOUSELEAVE: u32 = 0x02A3;
 
-static REGISTERED: AtomicBool = AtomicBool::new(false);
+/// The size an editor of this plugin was last left at, for instances whose state has none.
+static LAST_SIZE: AtomicU64 = AtomicU64::new(0);
+
+/// Where a new editor opens: the size saved in the plugin state, else the last one used in this
+/// process, else the base size.
+fn initial_size(spec: &UiSpec, shared: &Shared) -> (i32, i32) {
+    let last = LAST_SIZE.load(Ordering::Relaxed);
+    let last = ((last >> 32) as i32, (last & 0xFFFF_FFFF) as i32);
+    let (w, h) = shared.saved_size().or((last.0 > 0 && last.1 > 0).then_some(last)).unwrap_or_else(|| layout::default_size(spec));
+    layout::clamp_size(spec, w, h)
+}
+
+/// Remembers the editor size (in the plugin state and for the next editor opened).
+fn remember_size(shared: &Shared, w: i32, h: i32) {
+    shared.save_size(w, h);
+    if w > 0 && h > 0 {
+        LAST_SIZE.store((u64::from(w as u32) << 32) | u64::from(h as u32), Ordering::Relaxed);
+    }
+}
+
+/// Window classes registered by this module (one per plugin spec).
+static CLASSES: Mutex<Vec<String>> = Mutex::new(Vec::new());
 
 const fn rgb(r: u8, g: u8, b: u8) -> u32 {
     r as u32 | ((g as u32) << 8) | ((b as u32) << 16)
 }
 
-// Flat, matte palette: charcoal brown-black panel, one warm rust accent.
-const PANEL: u32 = rgb(0x1C, 0x19, 0x17);
-const BAR: u32 = rgb(0x27, 0x23, 0x20);
-const EDGE: u32 = rgb(0x0D, 0x0B, 0x0A);
-const FIELD: u32 = rgb(0x12, 0x10, 0x0F);
-const BTN: u32 = rgb(0x3A, 0x35, 0x31);
-const BTN_EDGE: u32 = rgb(0x58, 0x51, 0x4A);
-const RUST: u32 = rgb(0xB8, 0x5C, 0x32);
-const RUST_DIM: u32 = rgb(0x6B, 0x3B, 0x24);
-const TEXT: u32 = rgb(0xDA, 0xD2, 0xC6);
-const DIM: u32 = rgb(0x8E, 0x86, 0x7C);
-const DIAL: u32 = rgb(0x2C, 0x28, 0x25);
-const TRACK: u32 = rgb(0x3E, 0x38, 0x33);
-const POINTER: u32 = rgb(0xEE, 0xE8, 0xDE);
-const TIP_BG: u32 = rgb(0x0F, 0x0D, 0x0C);
+/// The editor's colours, one set per theme (chosen when drawing starts).
+#[derive(Clone, Copy)]
+struct Pal {
+    panel: u32,
+    bar: u32,
+    edge: u32,
+    field: u32,
+    btn: u32,
+    btn_edge: u32,
+    rust: u32,
+    rust_dim: u32,
+    text: u32,
+    dim: u32,
+    dial: u32,
+    track: u32,
+    pointer: u32,
+    tip_bg: u32,
+    /// Outline of a dial.
+    outline: u32,
+    inner_ring: u32,
+    pointer2: u32,
+}
+
+// Walnut: flat, matte charcoal brown-black panel, one warm rust accent.
+const WALNUT: Pal = Pal {
+    panel: rgb(0x1C, 0x19, 0x17),
+    bar: rgb(0x27, 0x23, 0x20),
+    edge: rgb(0x0D, 0x0B, 0x0A),
+    field: rgb(0x12, 0x10, 0x0F),
+    btn: rgb(0x3A, 0x35, 0x31),
+    btn_edge: rgb(0x58, 0x51, 0x4A),
+    rust: rgb(0xB8, 0x5C, 0x32),
+    rust_dim: rgb(0x6B, 0x3B, 0x24),
+    text: rgb(0xDA, 0xD2, 0xC6),
+    dim: rgb(0x8E, 0x86, 0x7C),
+    dial: rgb(0x2C, 0x28, 0x25),
+    track: rgb(0x3E, 0x38, 0x33),
+    pointer: rgb(0xEE, 0xE8, 0xDE),
+    tip_bg: rgb(0x0F, 0x0D, 0x0C),
+    outline: rgb(0x0D, 0x0B, 0x0A),
+    inner_ring: rgb(0x34, 0x2F, 0x2B),
+    pointer2: rgb(0xC8, 0xC4, 0xBE),
+};
+
+// Grey: dark grey panel, controls a step lighter, dials lighter still, outlines brighter than any
+// fill.
+const GREY: Pal = Pal {
+    panel: rgb(0x26, 0x28, 0x2B),
+    bar: rgb(0x2E, 0x30, 0x34),
+    edge: rgb(0x17, 0x18, 0x1A),
+    field: rgb(0x1D, 0x1E, 0x21),
+    btn: rgb(0x33, 0x36, 0x3B),
+    btn_edge: rgb(0x6A, 0x6E, 0x77),
+    rust: rgb(0xB8, 0x5C, 0x32),
+    rust_dim: rgb(0x6B, 0x3B, 0x24),
+    text: rgb(0xD9, 0xDB, 0xDE),
+    dim: rgb(0x8D, 0x91, 0x99),
+    dial: rgb(0x3C, 0x3F, 0x45),
+    track: rgb(0x34, 0x37, 0x3D),
+    pointer: rgb(0xF0, 0xF1, 0xF3),
+    tip_bg: rgb(0x1A, 0x1B, 0x1E),
+    outline: rgb(0x72, 0x76, 0x7F),
+    inner_ring: rgb(0x4B, 0x4E, 0x55),
+    pointer2: rgb(0xCF, 0xD2, 0xD6),
+};
+
+thread_local! {
+    static PAL: Cell<Pal> = const { Cell::new(WALNUT) };
+}
+
+/// The palette in use (set by `draw` from the spec's theme).
+fn p() -> Pal {
+    PAL.with(Cell::get)
+}
 
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(Some(0)).collect()
@@ -71,11 +152,12 @@ fn module() -> *mut c_void {
     h
 }
 
-fn register_class() -> bool {
-    if REGISTERED.load(Ordering::Acquire) {
+fn register_class(spec: &UiSpec) -> bool {
+    let Ok(mut classes) = CLASSES.lock() else { return false };
+    if classes.iter().any(|c| c == spec.class_name) {
         return true;
     }
-    let name = wide(CLASS_NAME);
+    let name = wide(spec.class_name);
     // SAFETY: a fully initialised class description; `name` outlives the call.
     let ok = unsafe {
         let wc = WNDCLASSEXW {
@@ -95,15 +177,16 @@ fn register_class() -> bool {
         RegisterClassExW(&wc) != 0
     };
     if ok {
-        REGISTERED.store(true, Ordering::Release);
+        classes.push(spec.class_name.to_string());
     }
     ok
 }
 
-/// Unregisters the window class (module exit).
+/// Unregisters the window classes (module exit).
 pub fn unregister_class() {
-    if REGISTERED.swap(false, Ordering::AcqRel) {
-        let name = wide(CLASS_NAME);
+    let Ok(mut classes) = CLASSES.lock() else { return };
+    for c in classes.drain(..) {
+        let name = wide(&c);
         // SAFETY: our class, registered by this module.
         unsafe { UnregisterClassW(name.as_ptr(), module()) };
     }
@@ -112,6 +195,7 @@ pub fn unregister_class() {
 // ---- the view ------------------------------------------------------------------------------
 
 struct View {
+    spec: &'static UiSpec,
     shared: Arc<Shared>,
     hwnd: Cell<HWND>,
     /// The host's IPlugFrame (not AddRef'd: the host keeps it alive while set), 0 when none.
@@ -126,13 +210,15 @@ impl Class for View {
 }
 
 /// A new editor view for the controller's values, as an owned `IPlugView` pointer.
-pub fn create_view(shared: Arc<Shared>) -> *mut IPlugView {
+pub fn create_view(shared: Arc<Shared>, spec: &'static UiSpec) -> *mut IPlugView {
+    let size = initial_size(spec, &shared);
     let view = View {
+        spec,
         shared,
         hwnd: Cell::new(std::ptr::null_mut()),
         frame: Rc::new(Cell::new(0)),
         me: Rc::new(Cell::new(0)),
-        size: Rc::new(Cell::new((layout::DEFAULT_W, layout::DEFAULT_H))),
+        size: Rc::new(Cell::new(size)),
     };
     let me = view.me.clone();
     match ComWrapper::new(view).to_com_ptr::<IPlugView>() {
@@ -174,13 +260,13 @@ impl IPlugViewTrait for View {
         if parent.is_null() || t.is_null() || unsafe { CStr::from_ptr(t) }.to_bytes() != b"HWND" {
             return kInvalidArgument;
         }
-        if !register_class() {
+        if !register_class(self.spec) {
             return kResultFalse;
         }
         self.destroy_window();
         let (w, h) = self.size.get();
-        let class = wide(CLASS_NAME);
-        let title = wide("Shifter");
+        let class = wide(self.spec.class_name);
+        let title = wide(self.spec.title);
         // SAFETY: a child of the host's live window, our registered class.
         let hwnd = unsafe {
             CreateWindowExW(
@@ -202,6 +288,7 @@ impl IPlugViewTrait for View {
             return kResultFalse;
         }
         let win = Box::new(Win {
+            spec: self.spec,
             shared: self.shared.clone(),
             frame: self.frame.clone(),
             me: self.me.clone(),
@@ -214,6 +301,7 @@ impl IPlugViewTrait for View {
             tracking: false,
             user: None,
             last_preset: 0,
+            last_meter: 0,
         });
         // SAFETY: our window; the box is reclaimed in WM_NCDESTROY.
         unsafe {
@@ -249,6 +337,7 @@ impl IPlugViewTrait for View {
         let Some(r) = (unsafe { size.as_ref() }) else { return kInvalidArgument };
         let (w, h) = ((r.right - r.left).max(1), (r.bottom - r.top).max(1));
         self.size.set((w, h));
+        remember_size(&self.shared, w, h);
         let hwnd = self.hwnd.get();
         if !hwnd.is_null() {
             // SAFETY: our live child window.
@@ -272,7 +361,7 @@ impl IPlugViewTrait for View {
     unsafe fn checkSizeConstraint(&self, rect: *mut ViewRect) -> tresult {
         // SAFETY: the host passes a writable rect or null.
         let Some(r) = (unsafe { rect.as_mut() }) else { return kInvalidArgument };
-        let (w, h) = layout::clamp_size(r.right - r.left, r.bottom - r.top);
+        let (w, h) = layout::clamp_size(self.spec, r.right - r.left, r.bottom - r.top);
         r.right = r.left + w;
         r.bottom = r.top + h;
         kResultTrue
@@ -286,7 +375,8 @@ enum Drag {
     Grip { x0: i32, y0: i32, w0: i32, h0: i32 },
 }
 
-struct Win {
+pub struct Win {
+    spec: &'static UiSpec,
     shared: Arc<Shared>,
     frame: Rc<Cell<usize>>,
     me: Rc<Cell<usize>>,
@@ -298,9 +388,11 @@ struct Win {
     tip: bool,
     tracking: bool,
     /// The User preset from Save (this editor session only).
-    user: Option<[f64; PARAM_COUNT]>,
+    user: Option<Vec<f64>>,
     /// The preset the arrows step from when the values match none.
     last_preset: usize,
+    /// The meter level (bits) last drawn.
+    last_meter: u32,
 }
 
 fn client_size(hwnd: HWND) -> (i32, i32) {
@@ -319,28 +411,28 @@ fn xy(lp: LPARAM) -> (i32, i32) {
     ((lp & 0xFFFF) as u16 as i16 as i32, ((lp >> 16) & 0xFFFF) as u16 as i16 as i32)
 }
 
-/// The preset whose values the current ones match (factory first, then User = `PRESETS.len()`).
-fn matching_preset(values: &[f64; PARAM_COUNT], user: Option<&[f64; PARAM_COUNT]>) -> Option<usize> {
+/// The preset whose values the current ones match (factory first, then User = `presets.len()`).
+pub fn matching_preset(spec: &UiSpec, values: &[f64], user: Option<&Vec<f64>>) -> Option<usize> {
     let near = |id: usize, n: f64| values.get(id).is_some_and(|v| (v - n).abs() < 1e-4);
-    PRESETS
+    spec.presets
         .iter()
-        .position(|(_, p)| p.iter().enumerate().all(|(id, v)| near(id, params::to_normalized(id as u32, *v))))
-        .or_else(|| user.filter(|u| u.iter().take(DSP_COUNT).enumerate().all(|(id, v)| near(id, *v))).map(|_| PRESETS.len()))
+        .position(|p| p.values.iter().enumerate().all(|(id, v)| near(id, spec.model.to_normalized(id as u32, *v))))
+        .or_else(|| user.filter(|u| u.iter().take(spec.model.dsp_count()).enumerate().all(|(id, v)| near(id, *v))).map(|_| spec.presets.len()))
 }
 
 fn apply_values(shared: &Shared, normalized: &[f64]) {
-    for (id, n) in normalized.iter().enumerate().take(DSP_COUNT) {
+    for (id, n) in normalized.iter().enumerate().take(shared.model().dsp_count()) {
         edit(shared, id as u32, *n);
     }
 }
 
 fn apply_preset(w: &mut Win, index: usize) {
-    if let Some((_, p)) = PRESETS.get(index) {
-        let n: Vec<f64> = p.iter().enumerate().map(|(id, v)| params::to_normalized(id as u32, *v)).collect();
+    if let Some(p) = w.spec.presets.get(index) {
+        let n: Vec<f64> = p.values.iter().enumerate().map(|(id, v)| w.spec.model.to_normalized(id as u32, *v)).collect();
         apply_values(&w.shared, &n);
         w.last_preset = index;
-    } else if let Some(u) = w.user {
-        apply_values(&w.shared, &u);
+    } else if let Some(u) = &w.user {
+        apply_values(&w.shared, u);
     }
 }
 
@@ -365,30 +457,42 @@ fn popup(hwnd: HWND, at: &Rect, items: &[&str], checked: Option<usize>) -> Optio
     }
 }
 
+/// For a click on a dropdown: its index, where to show the menu, the items and the checked one.
+fn dropdown_menu(hwnd: HWND, w: &mut Win, x: i32, y: i32) -> Option<(usize, Rect, Vec<&'static str>, Option<usize>)> {
+    let (cw, ch) = client_size(hwnd);
+    let l = layout::layout(w.spec, cw, ch);
+    let Some(Hit::Dropdown(i)) = layout::hit(&l, x, y) else { return None };
+    let (d, ds) = (l.dropdowns.get(i)?, w.spec.dropdowns.get(i)?);
+    w.tip = false;
+    let cur = w.spec.model.to_plain(ds.id, w.shared.get(ds.id)).round().max(0.0) as usize;
+    Some((i, d.rect, ds.options.to_vec(), Some(cur)))
+}
+
 /// For a click on the preset name: where to show the preset menu, its items and the checked one.
 fn preset_menu(hwnd: HWND, w: &mut Win, x: i32, y: i32) -> Option<(Rect, Vec<String>, Option<usize>)> {
     let (cw, ch) = client_size(hwnd);
-    let l = layout::layout(cw, ch);
+    let l = layout::layout(w.spec, cw, ch);
     if layout::hit(&l, x, y) != Some(Hit::PresetName) {
         return None;
     }
     w.tip = false;
-    let mut names: Vec<String> = PRESETS.iter().map(|(n, _)| (*n).to_string()).collect();
+    let mut names: Vec<String> = w.spec.presets.iter().map(|p| p.name.to_string()).collect();
     if w.user.is_some() {
         names.push("User".to_string());
     }
-    Some((l.name, names, matching_preset(&w.shared.snapshot(), w.user.as_ref())))
+    Some((l.name, names, matching_preset(w.spec, &w.shared.snapshot(), w.user.as_ref())))
 }
 
 fn click(hwnd: HWND, w: &mut Win, x: i32, y: i32, keys: usize, double: bool) {
     let (cw, ch) = client_size(hwnd);
-    let l = layout::layout(cw, ch);
+    let spec = w.spec;
+    let l = layout::layout(spec, cw, ch);
     let s = &w.shared;
     w.tip = false;
     match layout::hit(&l, x, y) {
         Some(Hit::Knob(id)) => {
             if double || keys & MK_CONTROL != 0 {
-                edit(s, id, params::default_normalized(id));
+                edit(s, id, spec.model.default_normalized(id));
             } else {
                 // SAFETY: our window.
                 unsafe { SetCapture(hwnd) };
@@ -396,17 +500,35 @@ fn click(hwnd: HWND, w: &mut Win, x: i32, y: i32, keys: usize, double: bool) {
                 w.drag = Some(Drag::Knob { id, y0: y, start: s.get(id) });
             }
         }
-        Some(Hit::ModeButton(i)) => edit(s, MODE, params::to_normalized(MODE, i as f64)),
-        Some(Hit::Phase) => edit(s, PHASE_SWAP, if s.get(PHASE_SWAP) >= 0.5 { 0.0 } else { 1.0 }),
-        Some(Hit::Bypass) => edit(s, BYPASS, if s.get(BYPASS) >= 0.5 { 0.0 } else { 1.0 }),
+        Some(Hit::Option(i)) => {
+            if let Some(sel) = spec.selector {
+                edit(s, sel.id, spec.model.to_normalized(sel.id, i as f64));
+            }
+        }
+        Some(Hit::Radio(i)) => {
+            if let Some(q) = spec.radios.get(i) {
+                let on = (spec.model.to_plain(q.id, s.get(q.id)) - q.value).abs() < 0.5;
+                let v = if on { q.off_value.unwrap_or(q.value) } else { q.value };
+                edit(s, q.id, spec.model.to_normalized(q.id, v));
+            }
+        }
+        // The dropdown menu is modal: `wndproc` shows it.
+        Some(Hit::Dropdown(_)) => {}
+        Some(Hit::Toggle(i)) => {
+            if let Some(t) = spec.toggles.get(i) {
+                edit(s, t.id, if s.get(t.id) >= 0.5 { 0.0 } else { 1.0 });
+            }
+        }
+        Some(Hit::Bypass) => edit(s, spec.bypass_id, if s.get(spec.bypass_id) >= 0.5 { 0.0 } else { 1.0 }),
+        Some(Hit::Meter) => {}
         Some(Hit::Reset) => apply_preset(w, 0),
         Some(Hit::Save) => {
             w.user = Some(s.snapshot());
             s.dirty.store(true, Ordering::Relaxed);
         }
         Some(Hit::PrevPreset) | Some(Hit::NextPreset) => {
-            let count = PRESETS.len() + usize::from(w.user.is_some());
-            let cur = matching_preset(&s.snapshot(), w.user.as_ref()).unwrap_or(w.last_preset);
+            let count = spec.presets.len() + usize::from(w.user.is_some());
+            let cur = matching_preset(spec, &s.snapshot(), w.user.as_ref()).unwrap_or(w.last_preset);
             let next = if layout::hit(&l, x, y) == Some(Hit::NextPreset) { (cur + 1) % count } else { (cur + count - 1) % count };
             apply_preset(w, next);
         }
@@ -436,7 +558,7 @@ fn mouse_move(hwnd: HWND, w: &mut Win, x: i32, y: i32, keys: usize) {
     match &w.drag {
         Some(Drag::Knob { id, y0, start }) => {
             let (cw, ch) = client_size(hwnd);
-            let n = layout::drag_value(*start, y0 - y, layout::layout(cw, ch).scale, keys & MK_SHIFT != 0);
+            let n = layout::drag_value(*start, y0 - y, layout::layout(w.spec, cw, ch).scale, keys & MK_SHIFT != 0);
             perform_edit(&w.shared, *id, n);
             invalidate(hwnd);
         }
@@ -444,12 +566,12 @@ fn mouse_move(hwnd: HWND, w: &mut Win, x: i32, y: i32, keys: usize) {
             let mut p = POINT { x: 0, y: 0 };
             // SAFETY: `p` is writable.
             unsafe { GetCursorPos(&mut p) };
-            let (nw, nh) = layout::clamp_size(w0 + p.x - x0, h0 + p.y - y0);
+            let (nw, nh) = layout::clamp_size(w.spec, w0 + p.x - x0, h0 + p.y - y0);
             resize(hwnd, w, nw, nh);
         }
         None => {
             let (cw, ch) = client_size(hwnd);
-            let h = layout::hit(&layout::layout(cw, ch), x, y);
+            let h = layout::hit(&layout::layout(w.spec, cw, ch), x, y);
             if h != w.hover {
                 w.hover = h;
                 w.hover_ticks = 0;
@@ -476,6 +598,7 @@ fn resize(hwnd: HWND, w: &Win, nw: i32, nh: i32) {
     };
     if !asked {
         w.size.set((nw, nh));
+        remember_size(&w.shared, nw, nh);
         // SAFETY: our window.
         unsafe { SetWindowPos(hwnd, std::ptr::null_mut(), 0, 0, nw, nh, SWP_NOZORDER | SWP_NOMOVE | SWP_NOACTIVATE) };
     }
@@ -510,7 +633,23 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 invalidate(hwnd);
             }
             // SAFETY: as above.
-            None => click(hwnd, unsafe { &mut *ptr }, x, y, wp, msg == WM_LBUTTONDBLCLK),
+            None => {
+                // SAFETY: this borrow ends before the modal menu below can re-enter.
+                match dropdown_menu(hwnd, unsafe { &mut *ptr }, x, y) {
+                    Some((i, at, names, cur)) => {
+                        if let Some(c) = popup(hwnd, &at, &names, cur) {
+                            // SAFETY: the menu is closed; nothing else borrows the state.
+                            let w = unsafe { &*ptr };
+                            if let Some(d) = w.spec.dropdowns.get(i) {
+                                edit(&w.shared, d.id, w.spec.model.to_normalized(d.id, c as f64));
+                            }
+                        }
+                        invalidate(hwnd);
+                    }
+                    // SAFETY: as above.
+                    None => click(hwnd, unsafe { &mut *ptr }, x, y, wp, msg == WM_LBUTTONDBLCLK),
+                }
+            }
         }
         return 0;
     }
@@ -518,7 +657,9 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
     let w = unsafe { &mut *ptr };
     match msg {
         WM_TIMER => {
-            if w.shared.dirty.swap(false, Ordering::Relaxed) {
+            flush_restart(&w.shared);
+            let meter = w.shared.meter().to_bits();
+            if w.shared.dirty.swap(false, Ordering::Relaxed) || (w.spec.meter.is_some() && meter != w.last_meter) {
                 invalidate(hwnd);
             }
             if w.hover.is_some() && !w.tip && w.drag.is_none() {
@@ -780,7 +921,7 @@ fn paint(hwnd: HWND, target: HDC, w: &Win) {
         }
         let old = SelectObject(mem, bmp);
         SetBkMode(mem, TRANSPARENT as i32);
-        draw(&Gdi { hdc: mem }, &layout::layout(bw, bh), w);
+        draw(&Gdi { hdc: mem }, &layout::layout(w.spec, bw, bh), w);
         SetStretchBltMode(target, HALFTONE);
         SetBrushOrgEx(target, 0, 0, std::ptr::null_mut());
         StretchBlt(target, 0, 0, cw, ch, mem, 0, 0, bw, bh, SRCCOPY);
@@ -793,26 +934,31 @@ fn paint(hwnd: HWND, target: HDC, w: &Win) {
 fn draw(g: &Gdi, l: &Layout, w: &Win) {
     let s = l.scale;
     let u = |v: f64| ((v * s).round() as i32).max(1);
-    let f = Fonts::new(s);
+    // The grey theme (portrait, bigger controls) uses larger type.
+    let f = Fonts::new(if w.spec.theme == Theme::Grey { s * 1.3 } else { s });
     let sh = &w.shared;
+    let spec = w.spec;
     let values = sh.snapshot();
-    let bypassed = sh.get(BYPASS) >= 0.5;
+    let bypassed = sh.get(spec.bypass_id) >= 0.5;
+    PAL.with(|c| c.set(if spec.theme == Theme::Grey { GREY } else { WALNUT }));
+    let grey = spec.theme == Theme::Grey;
     let full = Rect::new(0, 0, l.width, l.height);
-    g.fill(&full, PANEL);
+    g.fill(&full, p().panel);
 
+    if !grey {
     // Walnut veneer: under the preset bar, down both sides and along the bottom.
     let (wt, ws, wb) = (u(6.0), u(8.0), u(14.0));
     g.wood(&Rect::new(0, l.bar.bottom, l.width, l.bar.bottom + wt), false, 11);
     g.wood(&Rect::new(0, l.bar.bottom + wt, ws, l.height - wb), true, 23);
     g.wood(&Rect::new(l.width - ws, l.bar.bottom + wt, l.width, l.height - wb), true, 37);
     g.wood(&Rect::new(0, l.height - wb, l.width, l.height), false, 51);
-    g.fill(&Rect::new(ws, l.bar.bottom + wt, l.width - ws, l.bar.bottom + wt + u(1.0)), EDGE);
+    g.fill(&Rect::new(ws, l.bar.bottom + wt, l.width - ws, l.bar.bottom + wt + u(1.0)), p().edge);
 
     // Preset bar.
-    g.fill(&l.bar, BAR);
-    g.fill(&Rect::new(0, l.bar.bottom - u(1.0), l.width, l.bar.bottom), EDGE);
+    g.fill(&l.bar, p().bar);
+    g.fill(&Rect::new(0, l.bar.bottom - u(1.0), l.width, l.bar.bottom), p().edge);
     for (r, right) in [(l.prev, false), (l.next, true)] {
-        g.boxed(&r, BTN, BTN_EDGE, u(1.0));
+        g.boxed(&r, p().btn, p().btn_edge, u(1.0));
         let (cx, cy) = r.center();
         let a = u(4.0);
         let pts = if right {
@@ -820,90 +966,165 @@ fn draw(g: &Gdi, l: &Layout, w: &Win) {
         } else {
             [(cx + a / 2, cy - a), (cx + a / 2, cy + a), (cx - a, cy)]
         };
-        g.polygon(&pts, TEXT);
+        g.polygon(&pts, p().text);
     }
-    g.boxed(&l.name, FIELD, EDGE, u(1.0));
-    let name = match matching_preset(&values, w.user.as_ref()) {
-        Some(i) => PRESETS.get(i).map(|(n, _)| (*n).to_string()).unwrap_or_else(|| "User".to_string()),
-        None => format!("{} *", PRESETS.get(w.last_preset).map(|(n, _)| *n).unwrap_or("Default")),
+    g.boxed(&l.name, p().field, p().edge, u(1.0));
+    let name = match matching_preset(spec, &values, w.user.as_ref()) {
+        Some(i) => spec.presets.get(i).map(|p| p.name.to_string()).unwrap_or_else(|| "User".to_string()),
+        None => format!("{} *", spec.presets.get(w.last_preset).map(|p| p.name).unwrap_or("Default")),
     };
     let name_r = Rect::new(l.name.left + u(8.0), l.name.top, l.name.right - u(20.0), l.name.bottom);
-    g.text(&name_r, &name, f.name, RUST, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
+    g.text(&name_r, &name, f.name, p().rust, DT_LEFT | DT_VCENTER | DT_SINGLELINE | DT_END_ELLIPSIS);
     let (ax, ay) = (l.name.right - u(11.0), l.name.center().1);
-    g.polygon(&[(ax - u(3.5), ay - u(2.0)), (ax + u(3.5), ay - u(2.0)), (ax, ay + u(2.5))], DIM);
+    g.polygon(&[(ax - u(3.5), ay - u(2.0)), (ax + u(3.5), ay - u(2.0)), (ax, ay + u(2.5))], p().dim);
     // Save: an arrow into a tray.
-    g.boxed(&l.save, BTN, BTN_EDGE, u(1.0));
+    g.boxed(&l.save, p().btn, p().btn_edge, u(1.0));
     let (cx, cy) = l.save.center();
-    g.polyline(&[(cx - u(5.0), cy + u(1.0)), (cx - u(5.0), cy + u(5.0)), (cx + u(5.0), cy + u(5.0)), (cx + u(5.0), cy + u(1.0))], TEXT, u(1.4));
-    g.polyline(&[(cx, cy - u(6.0)), (cx, cy + u(1.0))], TEXT, u(1.4));
-    g.polygon(&[(cx - u(3.5), cy - u(1.0)), (cx + u(3.5), cy - u(1.0)), (cx, cy + u(3.0))], TEXT);
+    g.polyline(&[(cx - u(5.0), cy + u(1.0)), (cx - u(5.0), cy + u(5.0)), (cx + u(5.0), cy + u(5.0)), (cx + u(5.0), cy + u(1.0))], p().text, u(1.4));
+    g.polyline(&[(cx, cy - u(6.0)), (cx, cy + u(1.0))], p().text, u(1.4));
+    g.polygon(&[(cx - u(3.5), cy - u(1.0)), (cx + u(3.5), cy - u(1.0)), (cx, cy + u(3.0))], p().text);
     // Reset: a circular arrow.
-    g.boxed(&l.reset, BTN, BTN_EDGE, u(1.0));
+    g.boxed(&l.reset, p().btn, p().btn_edge, u(1.0));
     let (cx, cy) = l.reset.center();
     let ring: Vec<(i32, i32)> = (0..=24).map(|i| layout::polar(cx, cy, 5.0 * s, 100.0 + 290.0 * f64::from(i) / 24.0)).collect();
-    g.polyline(&ring, TEXT, u(1.4));
+    g.polyline(&ring, p().text, u(1.4));
     let tip = layout::polar(cx, cy, 5.0 * s, 100.0);
-    g.polygon(&[(tip.0 - u(3.5), tip.1 - u(3.0)), (tip.0 + u(1.5), tip.1 - u(3.5)), (tip.0 - u(0.5), tip.1 + u(1.5))], TEXT);
+    g.polygon(&[(tip.0 - u(3.5), tip.1 - u(3.0)), (tip.0 + u(1.5), tip.1 - u(3.5)), (tip.0 - u(0.5), tip.1 + u(1.5))], p().text);
+    // The bundle name, right-aligned before Bypass.
+    // SAFETY: letter spacing on our memory DC, reset right after.
+    unsafe { SetTextCharacterExtra(g.hdc, u(2.0)) };
+    g.text(&l.bundle, &BUNDLE_NAME.to_uppercase(), f.small, p().dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+    // SAFETY: as above.
+    unsafe { SetTextCharacterExtra(g.hdc, 0) };
     // Bypass.
-    let (bf, bt) = if bypassed { (RUST, FIELD) } else { (BTN, TEXT) };
-    g.boxed(&l.bypass, bf, BTN_EDGE, u(1.0));
+    let (bf, bt) = if bypassed { (p().rust, p().field) } else { (p().btn, p().text) };
+    g.boxed(&l.bypass, bf, p().btn_edge, u(1.0));
     g.text(&l.bypass, "BYPASS", f.small, bt, CENTER);
 
     // Title row: the accent line through the wordmark.
     for (a, b) in [l.line_left, l.line_right] {
-        g.fill(&Rect::new(a, l.line_y - u(1.0), b, l.line_y + u(1.0)), RUST);
+        g.fill(&Rect::new(a, l.line_y - u(1.0), b, l.line_y + u(1.0)), p().rust);
     }
     // SAFETY: letter spacing on our memory DC, reset right after.
     unsafe { SetTextCharacterExtra(g.hdc, u(3.0)) };
-    g.text(&l.wordmark, "SHIFTER", f.word, TEXT, CENTER);
+    g.text(&l.wordmark, &spec.title.to_uppercase(), f.word, p().text, CENTER);
     // SAFETY: as above.
     unsafe { SetTextCharacterExtra(g.hdc, 0) };
 
+    }
+
     // Knobs.
     for k in &l.knobs {
-        draw_knob(g, &f, k, values.get(k.id as usize).copied().unwrap_or(0.0), s, bypassed, w.hover == Some(Hit::Knob(k.id)));
+        draw_knob(g, &f, k, values.get(k.id as usize).copied().unwrap_or(0.0), s, bypassed, w.hover == Some(Hit::Knob(k.id)), spec);
     }
 
-    // Mode group.
-    let mode = params::to_plain(MODE, sh.get(MODE)).round() as usize;
-    for (i, (r, roman)) in l.modes.iter().zip(l.romans.iter()).enumerate() {
-        g.text(roman, ["I", "II", "III"].get(i).copied().unwrap_or(""), f.label, if i == mode { TEXT } else { DIM }, CENTER);
-        let on = i == mode;
-        g.boxed(r, BTN, if on { RUST } else { BTN_EDGE }, u(1.0));
-        // The lamp: a small square lit in the accent when active.
-        let (cx, cy) = r.center();
-        let a = u(4.0);
-        g.fill(&Rect::new(cx - a, cy - a, cx + a, cy + a), if on { RUST } else { EDGE });
+    // Selector groups.
+    if let (Some(sel), Some(ss)) = (&l.selector, spec.selector) {
+        draw_selector(g, &f, sel, &ss, spec.model.to_plain(ss.id, sh.get(ss.id)).round().max(0.0) as usize, s);
     }
-    let mc = l.mode_caption;
-    let (_, my) = mc.center();
-    g.fill(&Rect::new(l.modes[0].left, my, mc.left + u(22.0), my + u(1.0)), DIM);
-    g.fill(&Rect::new(mc.right - u(22.0), my, l.modes[2].right, my + u(1.0)), DIM);
-    g.text(&mc, "MODE", f.small, DIM, CENTER);
-    let mode_name = params::dsp_param(MODE).and_then(|p| p.choices.get(mode)).copied().unwrap_or("");
-    g.text(&l.mode_name, &mode_name.to_ascii_uppercase(), f.label, RUST, CENTER);
 
-    // Phase swap toggle.
-    let on = sh.get(PHASE_SWAP) >= 0.5;
-    g.text(&l.phase_label, "PHASE SWAP", f.small, DIM, CENTER);
-    g.boxed(&l.phase, if on { RUST_DIM } else { BTN }, if on { RUST } else { BTN_EDGE }, u(1.0));
-    let (cx, cy) = l.phase.center();
-    let pr = u(5.0);
-    g.ellipse(cx, cy, pr, if on { RUST_DIM } else { BTN }, if on { POINTER } else { DIM }, u(1.3));
-    g.polyline(&[(cx + pr, cy - pr - u(1.0)), (cx - pr, cy + pr + u(1.0))], if on { POINTER } else { DIM }, u(1.3));
-    g.text(&l.phase_value, if on { "ON" } else { "OFF" }, f.small, if on { RUST } else { DIM }, CENTER);
+    // Dropdowns.
+    for (i, (d, ds)) in l.dropdowns.iter().zip(spec.dropdowns.iter()).enumerate() {
+        let cur = spec.model.to_plain(ds.id, sh.get(ds.id)).round().max(0.0) as usize;
+        let hot = w.hover == Some(Hit::Dropdown(i));
+        g.boxed(&d.rect, p().btn, if hot { p().rust } else { p().btn_edge }, u(1.0));
+        g.text(&d.caption, ds.caption, f.small, p().dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&d.value, ds.options.get(cur).copied().unwrap_or(""), f.label, p().text, CENTER);
+        let (ax, ay) = d.arrow.center();
+        g.polyline(&[(ax - u(4.0), ay - u(2.0)), (ax, ay + u(2.0)), (ax + u(4.0), ay - u(2.0))], p().text, u(1.4));
+    }
+
+    // Dividers.
+    for r in &l.rules {
+        g.fill(&Rect::new(r.left, r.top, r.right, r.top + u(1.0)), p().btn_edge);
+    }
+
+    // Fixed texts.
+    for (r, t) in &l.labels {
+        g.text(r, t, f.label, p().dim, CENTER);
+    }
+
+    // Radio buttons.
+    for (q, qs) in l.radios.iter().zip(spec.radios.iter()) {
+        let on = (spec.model.to_plain(qs.id, sh.get(qs.id)) - qs.value).abs() < 0.5;
+        let bare = qs.label.is_empty();
+        let rad = f64::from(qs.r);
+        g.ellipse(q.dot.0, q.dot.1, u(rad), p().btn, if on { p().rust } else { p().btn_edge }, u(2.0));
+        if on {
+            g.ellipse(q.dot.0, q.dot.1, u(rad * 0.5), p().rust, p().rust, u(1.0));
+        }
+        if !bare {
+            g.text(&q.label, qs.label, f.label, if on { p().text } else { p().dim }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        }
+    }
+
+    // Switches.
+    for (t, ts) in l.toggles.iter().zip(spec.toggles.iter()) {
+        let on = sh.get(ts.id) >= 0.5;
+        if ts.glyph == Glyph::Check {
+            g.boxed(&t.rect, p().btn, if on { p().rust } else { p().btn_edge }, u(2.0));
+            if on {
+                let (cx, cy) = t.rect.center();
+                g.polyline(&[(cx - u(8.0), cy), (cx - u(2.5), cy + u(6.0)), (cx + u(9.0), cy - u(8.0))], p().rust, u(3.0));
+            }
+            g.text(&t.label, ts.label, f.label, if on { p().text } else { p().dim }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+            continue;
+        }
+        g.text(&t.label, ts.label, f.small, p().dim, CENTER);
+        g.boxed(&t.rect, if on && ts.glyph == Glyph::Phase { p().rust_dim } else { p().btn }, if on { p().rust } else { p().btn_edge }, u(1.0));
+        let (cx, cy) = t.rect.center();
+        match ts.glyph {
+            Glyph::Phase => {
+                let pr = u(5.0);
+                let fill = if on { p().rust_dim } else { p().btn };
+                let ink = if on { p().pointer } else { p().dim };
+                g.ellipse(cx, cy, pr, fill, ink, u(1.3));
+                g.polyline(&[(cx + pr, cy - pr - u(1.0)), (cx - pr, cy + pr + u(1.0))], ink, u(1.3));
+            }
+            Glyph::Lamp | Glyph::Check => {
+                let a = u(4.0);
+                g.fill(&Rect::new(cx - a, cy - a, cx + a, cy + a), if on { p().rust } else { p().edge });
+            }
+        }
+        g.text(&t.value, if on { ts.on_text } else { ts.off_text }, f.small, if on { p().rust } else { p().dim }, CENTER);
+    }
+
+    // Input meter: peak bar, with a marker where the signal starts to hit the shaper.
+    if let (Some(m), Some(ms)) = (&l.meter, spec.meter) {
+        g.text(&m.caption, ms.caption, f.small, p().dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        g.boxed(&m.bar, p().field, p().edge, u(1.0));
+        let inner = Rect::new(m.bar.left + u(2.0), m.bar.top + u(2.0), m.bar.right - u(2.0), m.bar.bottom - u(2.0));
+        let peak_db = paint::level_db(sh.meter());
+        let at = |db: f32| inner.left + (paint::meter_fraction(db, ms.floor_db, ms.ceil_db) * inner.width() as f32).round() as i32;
+        let marker = spec.model.meter_marker_db(&values).filter(|db| *db >= ms.floor_db && *db <= ms.ceil_db);
+        let (seg, gap) = (u(4.0), u(1.0));
+        let lit = at(peak_db);
+        let mut x = inner.left;
+        while x + seg <= inner.right {
+            let hot = marker.is_some_and(|db| x + seg / 2 >= at(db));
+            let color = if x + seg <= lit { if hot { p().pointer } else { p().rust } } else { p().track };
+            g.fill(&Rect::new(x, inner.top, x + seg, inner.bottom), color);
+            x += seg + gap;
+        }
+        if let Some(db) = marker {
+            let mx = at(db);
+            g.fill(&Rect::new(mx - u(1.0), m.bar.top - u(2.0), mx + u(1.0), m.bar.bottom + u(2.0)), p().text);
+        }
+        let readout = if peak_db > -90.0 { format!("{peak_db:.0} dB") } else { "-inf".to_string() };
+        g.text(&m.readout, &readout, f.small, p().dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+    }
 
     // Resize grip.
     for i in 1..=3 {
         let o = u(4.0) * i;
-        g.polyline(&[(l.width - o - u(2.0), l.height - u(2.0)), (l.width - u(2.0), l.height - o - u(2.0))], DIM, u(1.0));
+        g.polyline(&[(l.width - o - u(2.0), l.height - u(2.0)), (l.width - u(2.0), l.height - o - u(2.0))], p().dim, u(1.0));
     }
 
     // Tooltip.
     if w.tip
         && let Some(h) = w.hover
     {
-        let text = layout::tooltip(h);
+        let text = layout::tooltip(spec, h);
         if !text.is_empty() {
             let pad = u(6.0);
             let (tw, th) = g.measure(text, f.small, u(260.0));
@@ -913,167 +1134,186 @@ fn draw(g: &Gdi, l: &Layout, w: &Win) {
             let x = hx.min(l.width - bw - u(4.0)).max(u(4.0));
             let y = if hy + bh > l.height - u(4.0) { (w.hover_at.1 * SS - bh - u(8.0)).max(u(4.0)) } else { hy };
             let r = Rect::new(x, y, x + bw, y + bh);
-            g.boxed(&r, TIP_BG, RUST_DIM, u(1.0));
-            g.text(&Rect::new(x + pad, y + pad, x + pad + tw, y + pad + th), text, f.small, TEXT, DT_LEFT | DT_WORDBREAK);
+            g.boxed(&r, p().tip_bg, p().rust_dim, u(1.0));
+            g.text(&Rect::new(x + pad, y + pad, x + pad + tw, y + pad + th), text, f.small, p().text, DT_LEFT | DT_WORDBREAK);
         }
     }
 }
 
-fn draw_knob(g: &Gdi, f: &Fonts, k: &Knob, n: f64, s: f64, bypassed: bool, hot: bool) {
+/// One row of exclusive buttons with its marks, caption rule and the selected name.
+fn draw_selector(g: &Gdi, f: &Fonts, sel: &layout::Selector, ss: &SelectorSpec, cur: usize, s: f64) {
     let u = |v: f64| ((v * s).round() as i32).max(1);
-    let big = k.r > u(20.0);
-    let ring = f64::from(k.r) + 6.0 * s;
-    let thick = if big { u(3.0) } else { u(2.0) };
-    g.polyline(&layout::arc_points(k.cx, k.cy, ring, 0.0, 1.0), TRACK, thick);
-    // Output is bipolar: its arc starts at 0 dB.
-    let from = if k.id == 6 { params::to_normalized(6, 0.0) } else { 0.0 };
-    if (n - from).abs() > 1e-4 {
-        g.polyline(&layout::arc_points(k.cx, k.cy, ring, from.min(n), from.max(n)), if bypassed { RUST_DIM } else { RUST }, thick);
+    for (i, (r, mark)) in sel.buttons.iter().zip(sel.marks.iter()).enumerate() {
+        let on = i == cur;
+        g.text(mark, ss.options.get(i).map_or("", |o| o.mark), f.label, if on { p().text } else { p().dim }, CENTER);
+        g.boxed(r, p().btn, if on { p().rust } else { p().btn_edge }, u(1.0));
+        // The lamp: a small square lit in the accent when active.
+        let (cx, cy) = r.center();
+        let a = u(4.0);
+        g.fill(&Rect::new(cx - a, cy - a, cx + a, cy + a), if on { p().rust } else { p().edge });
     }
-    g.ellipse(k.cx, k.cy, k.r, DIAL, EDGE, u(2.0));
+    let mc = sel.caption;
+    let (_, my) = mc.center();
+    if let (Some(first), Some(last)) = (sel.buttons.first(), sel.buttons.last()) {
+        g.fill(&Rect::new(first.left, my, mc.left + u(22.0), my + u(1.0)), p().dim);
+        g.fill(&Rect::new(mc.right - u(22.0), my, last.right, my + u(1.0)), p().dim);
+    }
+    g.text(&mc, ss.caption, f.small, p().dim, CENTER);
+    let cur_name = ss.options.get(cur).map_or("", |o| o.name);
+    g.text(&sel.name, &cur_name.to_ascii_uppercase(), f.label, p().rust, CENTER);
+}
+
+fn draw_knob(g: &Gdi, f: &Fonts, k: &Knob, n: f64, s: f64, bypassed: bool, hot: bool, spec: &UiSpec) {
+    let u = |v: f64| ((v * s).round() as i32).max(1);
+    let ring = f64::from(k.r) + 6.0 * s;
+    let thick = if k.big { u(3.0) } else { u(2.0) };
+    g.polyline(&layout::arc_points(k.cx, k.cy, ring, 0.0, 1.0), p().track, thick);
+    // A bipolar knob's arc starts at its origin.
+    let from = k.origin;
+    if (n - from).abs() > 1e-4 {
+        g.polyline(&layout::arc_points(k.cx, k.cy, ring, from.min(n), from.max(n)), if bypassed { p().rust_dim } else { p().rust }, thick);
+    }
+    g.ellipse(k.cx, k.cy, k.r, p().dial, p().outline, u(2.0));
     // A faint inner ring for depth, then the pointer.
-    g.ellipse(k.cx, k.cy, k.r - u(4.0), DIAL, rgb(0x34, 0x2F, 0x2B), u(1.0));
+    g.ellipse(k.cx, k.cy, k.r - u(4.0), p().dial, p().inner_ring, u(1.0));
     let a = layout::knob_angle(n);
     let r = f64::from(k.r);
     g.polyline(
         &[layout::polar(k.cx, k.cy, r * 0.3, a), layout::polar(k.cx, k.cy, r * 0.88, a)],
-        rgb(0xC8, 0xC4, 0xBE),
-        if big { u(1.6) } else { u(1.3) },
+        p().pointer2,
+        if k.big { u(1.6) } else { u(1.3) },
     );
-    let value = params::format(k.id, n);
-    if big {
-        g.text(&k.label, k.caption, f.label, TEXT, CENTER);
-        g.text(&k.end_left, k.ends.0, f.small, DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        g.text(&k.end_right, k.ends.1, f.small, DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        g.text(&k.value, &value, f.small, if hot { TEXT } else { DIM }, CENTER);
+    let value = spec.model.format(k.id, n);
+    let vcol = if hot { p().text } else { p().dim };
+    if k.below {
+        g.text(&k.label, k.caption, f.label, p().text, CENTER);
+        g.text(&k.value, &spec.model.format_short(k.id, n), f.small, vcol, CENTER);
+    } else if k.big {
+        g.text(&k.label, k.caption, f.label, p().text, CENTER);
+        g.text(&k.end_left, k.ends.0, f.small, p().dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.end_right, k.ends.1, f.small, p().dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.value, &value, f.small, vcol, CENTER);
     } else {
-        g.text(&k.label, k.caption, f.label, TEXT, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
-        g.text(&k.value, &value, f.small, if hot { TEXT } else { DIM }, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        g.text(&k.end_left, k.ends.0, f.small, DIM, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
-        g.text(&k.end_right, k.ends.1, f.small, DIM, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.label, k.caption, f.label, p().text, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.value, &value, f.small, vcol, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.end_left, k.ends.0, f.small, p().dim, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
+        g.text(&k.end_right, k.ends.1, f.small, p().dim, DT_RIGHT | DT_VCENTER | DT_SINGLELINE);
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
+/// Renders the editor for `shared` into an off-screen parent window, captures it with
+/// PrintWindow and saves a PNG to `path`, with `hover` showing its tooltip. Also resizes through
+/// `onSize` and detaches. For tests and screenshots (feature `capture`); never shown on a monitor.
+#[cfg(feature = "capture")]
+pub fn capture_png(shared: Arc<Shared>, spec: &'static UiSpec, hover: Option<Hit>, path: &std::path::Path) -> Result<(), String> {
     use windows_sys::Win32::Storage::Xps::PrintWindow;
-
-    /// Opens the editor in an off-screen parent window, captures it with PrintWindow and saves a PNG
-    /// (to `SHIFTER_UI_PNG`, else the temp folder). Checks the capture is not blank.
-    #[test]
-    fn editor_renders_headless() {
-        let shared = Arc::new(Shared::new());
-        shared.set(MODE, 0.5);
-        shared.set(PHASE_SWAP, 1.0);
-        let view = create_view(shared.clone());
-        assert!(!view.is_null());
-        // SAFETY: test-only Win32 and COM calls on objects created here.
-        unsafe {
-            let v = ComRef::from_raw(view).unwrap_or_else(|| panic!("view"));
-            assert_eq!(v.isPlatformTypeSupported(c"HWND".as_ptr()), kResultTrue);
-            let mut r = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
-            assert_eq!(v.getSize(&mut r), kResultOk);
-            let (w, h) = (r.right - r.left, r.bottom - r.top);
-            assert_eq!((w, h), (layout::DEFAULT_W, layout::DEFAULT_H));
-            let class = wide("STATIC");
-            let parent = CreateWindowExW(
-                WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
-                class.as_ptr(),
-                std::ptr::null(),
-                WS_POPUP,
-                -20000,
-                -20000,
-                w,
-                h,
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null(),
-            );
-            assert!(!parent.is_null());
-            assert_eq!(v.attached(parent, c"HWND".as_ptr()), kResultOk);
-            // Shown far off-screen (never on a monitor), so the window has real content to print.
-            ShowWindow(parent, SW_SHOWNOACTIVATE);
-            let child = GetWindow(parent, GW_CHILD);
-            assert!(!child.is_null());
-            // Hover a mode button long enough for its tooltip.
-            if let Some(win) = (GetWindowLongPtrW(child, GWLP_USERDATA) as *mut Win).as_mut() {
-                let l = layout::layout(w, h);
-                win.hover = Some(Hit::ModeButton(1));
-                win.hover_at = l.modes[1].center();
+    let view = create_view(shared, spec);
+    if view.is_null() {
+        return Err("no view".into());
+    }
+    // SAFETY: Win32 and COM calls on objects created here; everything is released before return.
+    unsafe {
+        let v = ComRef::from_raw(view).ok_or("view")?;
+        if v.isPlatformTypeSupported(c"HWND".as_ptr()) != kResultTrue {
+            return Err("HWND unsupported".into());
+        }
+        let mut r = ViewRect { left: 0, top: 0, right: 0, bottom: 0 };
+        v.getSize(&mut r);
+        let (w, h) = (r.right - r.left, r.bottom - r.top);
+        if (w, h) != layout::default_size(spec) {
+            return Err(format!("default size {w}x{h}"));
+        }
+        let class = wide("STATIC");
+        let parent = CreateWindowExW(
+            WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+            class.as_ptr(),
+            std::ptr::null(),
+            WS_POPUP,
+            -20000,
+            -20000,
+            w,
+            h,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null(),
+        );
+        if parent.is_null() {
+            return Err("parent window".into());
+        }
+        if v.attached(parent, c"HWND".as_ptr()) != kResultOk {
+            return Err("attached".into());
+        }
+        // Shown far off-screen (never on a monitor), so the window has real content to print.
+        ShowWindow(parent, SW_SHOWNOACTIVATE);
+        let child = GetWindow(parent, GW_CHILD);
+        if child.is_null() {
+            return Err("no child".into());
+        }
+        if let Some(win) = (GetWindowLongPtrW(child, GWLP_USERDATA) as *mut Win).as_mut() {
+            let l = layout::layout(spec, w, h);
+            if let Some(hv) = hover {
+                let at = match hv {
+                    Hit::Option(i) => l.selector.as_ref().and_then(|s| s.buttons.get(i)).map(Rect::center),
+                    Hit::Toggle(i) => l.toggles.get(i).map(|t| t.rect.center()),
+                    Hit::Knob(id) => l.knobs.iter().find(|k| k.id == id).map(|k| (k.cx, k.cy)),
+                    Hit::Meter => l.meter.as_ref().map(|m| m.bar.center()),
+                    Hit::Bypass => Some(l.bypass.center()),
+                    _ => None,
+                };
+                win.hover = Some(hv);
+                win.hover_at = at.unwrap_or((w / 2, h / 2));
                 win.tip = true;
             }
-            let screen = GetDC(std::ptr::null_mut());
-            let mem = CreateCompatibleDC(screen);
-            let bmp = CreateCompatibleBitmap(screen, w, h);
-            let old = SelectObject(mem, bmp);
-            UpdateWindow(child);
-            let pw = PrintWindow(child, mem, 0);
-            assert_ne!(pw, 0, "PrintWindow");
-            SelectObject(mem, old);
-            let mut info: BITMAPINFO = std::mem::zeroed();
-            info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
-            info.bmiHeader.biWidth = w;
-            info.bmiHeader.biHeight = -h;
-            info.bmiHeader.biPlanes = 1;
-            info.bmiHeader.biBitCount = 32;
-            let mut px = vec![0u8; (w * h * 4) as usize];
-            let lines = GetDIBits(mem, bmp, 0, h as u32, px.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
-            assert_eq!(lines, h);
-            DeleteObject(bmp);
-            DeleteDC(mem);
-            ReleaseDC(std::ptr::null_mut(), screen);
-            // BGRA -> RGBA, opaque.
-            for p in px.as_chunks_mut::<4>().0 {
-                p.swap(0, 2);
-                p[3] = 255;
-            }
-            let distinct: std::collections::HashSet<[u8; 3]> = px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
-            assert!(distinct.len() > 50, "the capture is blank: {} colours", distinct.len());
-            // The panel colour is the most common one.
-            let path =
-                std::env::var_os("SHIFTER_UI_PNG").map(std::path::PathBuf::from).unwrap_or_else(|| std::env::temp_dir().join("shifter_ui.png"));
-            image::save_buffer(&path, &px, w as u32, h as u32, image::ColorType::Rgba8).unwrap_or_else(|e| panic!("save {path:?}: {e}"));
-            eprintln!("editor capture: {}", path.display());
-            // Resize through onSize and detach.
-            let mut big = ViewRect { left: 0, top: 0, right: 900, bottom: 464 };
-            assert_eq!(v.checkSizeConstraint(&mut big), kResultTrue);
-            assert_eq!(v.onSize(&mut big), kResultOk);
-            let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
-            GetClientRect(child, &mut rc);
-            assert_eq!((rc.right, rc.bottom), (900, 464));
-            assert_eq!(v.removed(), kResultOk);
-            assert!(GetWindow(parent, GW_CHILD).is_null(), "removed destroys the child");
-            DestroyWindow(parent);
-            drop(vst3::ComPtr::from_raw(view));
+        }
+        let screen = GetDC(std::ptr::null_mut());
+        let mem = CreateCompatibleDC(screen);
+        let bmp = CreateCompatibleBitmap(screen, w, h);
+        let old = SelectObject(mem, bmp);
+        UpdateWindow(child);
+        let pw = PrintWindow(child, mem, 0);
+        SelectObject(mem, old);
+        let mut info: BITMAPINFO = std::mem::zeroed();
+        info.bmiHeader.biSize = std::mem::size_of::<BITMAPINFOHEADER>() as u32;
+        info.bmiHeader.biWidth = w;
+        info.bmiHeader.biHeight = -h;
+        info.bmiHeader.biPlanes = 1;
+        info.bmiHeader.biBitCount = 32;
+        let mut px = vec![0u8; (w * h * 4) as usize];
+        let lines = GetDIBits(mem, bmp, 0, h as u32, px.as_mut_ptr().cast(), &mut info, DIB_RGB_COLORS);
+        DeleteObject(bmp);
+        DeleteDC(mem);
+        ReleaseDC(std::ptr::null_mut(), screen);
+        if pw == 0 || lines != h {
+            return Err("PrintWindow / GetDIBits failed".into());
+        }
+        // BGRA -> RGBA, opaque.
+        for p in px.as_chunks_mut::<4>().0 {
+            p.swap(0, 2);
+            p[3] = 255;
+        }
+        let distinct: std::collections::HashSet<[u8; 3]> = px.as_chunks::<4>().0.iter().map(|p| [p[0], p[1], p[2]]).collect();
+        if distinct.len() <= 50 {
+            return Err(format!("the capture is blank: {} colours", distinct.len()));
+        }
+        image::save_buffer(path, &px, w as u32, h as u32, image::ColorType::Rgba8).map_err(|e| format!("save {path:?}: {e}"))?;
+        // Resize through onSize and detach.
+        let (bw, bh) = (w * 3 / 2, h * 3 / 2);
+        let mut big = ViewRect { left: 0, top: 0, right: bw, bottom: bh };
+        v.checkSizeConstraint(&mut big);
+        v.onSize(&mut big);
+        let mut rc = RECT { left: 0, top: 0, right: 0, bottom: 0 };
+        GetClientRect(child, &mut rc);
+        let resized = (rc.right, rc.bottom) == (big.right, big.bottom);
+        let removed = v.removed() == kResultOk && GetWindow(parent, GW_CHILD).is_null();
+        DestroyWindow(parent);
+        drop(vst3::ComPtr::from_raw(view));
+        if !resized {
+            return Err(format!("resize gave {}x{}", rc.right, rc.bottom));
+        }
+        if !removed {
+            return Err("removed did not destroy the child".into());
         }
     }
-
-    #[test]
-    fn presets_match_and_values_apply() {
-        let shared = Shared::new();
-        assert_eq!(matching_preset(&shared.snapshot(), None), Some(0), "defaults are the Default preset");
-        shared.set(1, 0.9);
-        assert_eq!(matching_preset(&shared.snapshot(), None), None);
-        let user = shared.snapshot();
-        assert_eq!(matching_preset(&shared.snapshot(), Some(&user)), Some(PRESETS.len()));
-        let mut w = Win {
-            shared: Arc::new(Shared::new()),
-            frame: Rc::new(Cell::new(0)),
-            me: Rc::new(Cell::new(0)),
-            size: Rc::new(Cell::new((1, 1))),
-            drag: None,
-            hover: None,
-            hover_at: (0, 0),
-            hover_ticks: 0,
-            tip: false,
-            tracking: false,
-            user: None,
-            last_preset: 0,
-        };
-        apply_preset(&mut w, 4);
-        assert_eq!(matching_preset(&w.shared.snapshot(), None), Some(4));
-        assert_eq!(w.shared.plain(MODE), 2.0);
-    }
+    Ok(())
 }

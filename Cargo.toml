@@ -4,9 +4,9 @@ members = ["crates/*"]
 default-members = ["crates/*"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
-license = "MIT OR Apache-2.0"
+license = "MIT"
 rust-version = "1.90"
 repository = "https://github.com/DeadlyGoonman/shifter-vst3"
 
@@ -14,6 +14,7 @@ repository = "https://github.com/DeadlyGoonman/shifter-vst3"
 soundcraft-dsp = { path = "crates/dsp" }
 soundcraft-vst3-host = { path = "crates/vst3-host" }
 soundcraft-editor-scale = { path = "crates/editor-scale" }
+bentsignal-ui = { path = "crates/bentsignal-ui" }
 
 thiserror = "2"
 serde = { version = "1", features = ["derive", "rc"] }

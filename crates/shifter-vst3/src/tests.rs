@@ -431,13 +431,13 @@ fn editor_edits_reach_the_host_handler() {
     unsafe {
         assert_eq!(e.setComponentHandler(h.as_com_ref::<IComponentHandler>().unwrap().as_ptr()), kResultOk);
     }
-    crate::plugin::edit(&plugin.shared, 2, 0.75);
+    bentsignal_ui::host::edit(&plugin.shared, 2, 0.75);
     assert_eq!(*h.log.lock().unwrap(), vec![('b', 2, 0.0), ('p', 2, 0.75), ('e', 2, 0.0)]);
     assert_eq!(unsafe { e.getParamNormalized(2) }, 0.75, "the editor's edit shows in the controller at once");
     unsafe {
         assert_eq!(e.terminate(), kResultOk);
     }
-    crate::plugin::edit(&plugin.shared, 2, 0.1);
+    bentsignal_ui::host::edit(&plugin.shared, 2, 0.1);
     assert_eq!(h.log.lock().unwrap().len(), 3, "no edits reach a released handler");
 }
 #[test]

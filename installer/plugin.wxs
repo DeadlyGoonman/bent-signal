@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Bent Signal VST3 MSI (WiX v5), one per plugin. Built by scripts/package.ps1:
+       wix build plugin.wxs -arch x64 -d Name=Plumb -d Version=... -d BundleDir=... -d UpgradeCode=... -d GuidBin=... -d GuidRes=... -o out.msi -->
+<Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
+  <Package
+      Name="$(var.Name) VST3"
+      Manufacturer="Bent Signal"
+      Version="$(var.Version)"
+      UpgradeCode="$(var.UpgradeCode)"
+      Scope="perMachine"
+      Compressed="yes"
+      Language="1033">
+    <SummaryInformation Description="$(var.Name) VST3 plugin" Manufacturer="Bent Signal" />
+    <MajorUpgrade AllowSameVersionUpgrades="yes"
+        DowngradeErrorMessage="A newer version of $(var.Name) VST3 is already installed." />
+    <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
+
+    <StandardDirectory Id="CommonFiles64Folder">
+      <Directory Id="Vst3Folder" Name="VST3">
+        <Directory Id="BundleFolder" Name="$(var.Name).vst3">
+          <Directory Id="ContentsFolder" Name="Contents">
+            <Directory Id="BinFolder" Name="x86_64-win" />
+            <Directory Id="ResFolder" Name="Resources" />
+          </Directory>
+        </Directory>
+      </Directory>
+    </StandardDirectory>
+
+    <Feature Id="Main" Title="$(var.Name) VST3" Level="1">
+      <ComponentRef Id="PluginBinary" />
+      <ComponentRef Id="PluginResources" />
+    </Feature>
+
+    <!-- The shared VST3 folder is left in place on uninstall by Windows Installer if non-empty. -->
+    <Component Id="PluginBinary" Directory="BinFolder" Guid="$(var.GuidBin)">
+      <File Id="PluginDll" Source="$(var.BundleDir)\Contents\x86_64-win\$(var.Name).vst3" KeyPath="yes" />
+    </Component>
+    <Component Id="PluginResources" Directory="ResFolder" Guid="$(var.GuidRes)">
+      <CreateFolder />
+      <RegistryValue Root="HKLM" Key="Software\Bent Signal\$(var.Name)" Name="Version" Value="$(var.Version)" Type="string" KeyPath="yes" />
+    </Component>
+  </Package>
+</Wix>

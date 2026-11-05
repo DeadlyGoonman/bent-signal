@@ -12,6 +12,32 @@ pub struct DetectedNote {
 
 /// Fundamental frequency of one frame, or None when unvoiced. `threshold` ≈ 0.1–0.2.
 pub fn yin(frame: &[f32], sample_rate: f32, min_hz: f32, max_hz: f32, threshold: f32) -> Option<f32> {
+    let mut scratch = YinScratch::default();
+    scratch.reserve(frame.len());
+    yin_with(frame, sample_rate, min_hz, max_hz, threshold, &mut scratch)
+}
+
+/// Work buffers for [`yin_with`], so realtime callers can analyse without allocating.
+#[derive(Debug, Clone, Default)]
+pub struct YinScratch {
+    d: Vec<f32>,
+    cmnd: Vec<f32>,
+}
+
+impl YinScratch {
+    /// Sizes the buffers for frames of up to `frame_len` samples (allocates; call outside audio).
+    pub fn reserve(&mut self, frame_len: usize) {
+        let n = frame_len / 2 + 2;
+        if self.d.len() < n {
+            self.d = vec![0.0; n];
+            self.cmnd = vec![1.0; n];
+        }
+    }
+}
+
+/// [`yin`] with caller-owned buffers: never allocates; `None` when `scratch` was reserved for a
+/// shorter frame.
+pub fn yin_with(frame: &[f32], sample_rate: f32, min_hz: f32, max_hz: f32, threshold: f32, scratch: &mut YinScratch) -> Option<f32> {
     if !(sample_rate.is_finite() && sample_rate > 0.0) || frame.len() < 64 {
         return None;
     }
@@ -21,39 +47,39 @@ pub fn yin(frame: &[f32], sample_rate: f32, min_hz: f32, max_hz: f32, threshold:
         return None;
     }
     let w = frame.len() - max_tau;
-    let mut d = vec![0.0f32; max_tau + 1];
-    for (tau, dv) in d.iter_mut().enumerate().skip(1) {
-        let mut sum = 0.0f32;
-        for j in 0..w {
-            let (Some(a), Some(b)) = (frame.get(j), frame.get(j + tau)) else { break };
-            let diff = a - b;
-            sum += diff * diff;
-        }
-        *dv = sum;
+    let d = scratch.d.get_mut(..=max_tau)?;
+    let cmnd = scratch.cmnd.get_mut(..=max_tau)?;
+    let head = frame.get(..w)?;
+    for (tau, dv) in d.iter_mut().enumerate() {
+        *dv = match (tau, frame.get(tau..tau + w)) {
+            (0, _) | (_, None) => 0.0,
+            (_, Some(lag)) => head.iter().zip(lag).map(|(a, b)| (a - b) * (a - b)).sum(),
+        };
     }
     // Cumulative mean normalised difference.
-    let mut cmnd = vec![1.0f32; max_tau + 1];
     let mut running = 0.0f32;
-    for tau in 1..=max_tau {
-        let v = d.get(tau).copied().unwrap_or(0.0);
-        running += v;
-        if let Some(c) = cmnd.get_mut(tau) {
-            *c = if running > 0.0 { v * tau as f32 / running } else { 1.0 };
+    for (tau, (c, v)) in cmnd.iter_mut().zip(d.iter()).enumerate() {
+        if tau == 0 {
+            *c = 1.0;
+            continue;
         }
+        running += v;
+        *c = if running > 0.0 { v * tau as f32 / running } else { 1.0 };
     }
+    let at = |i: usize| cmnd.get(i).copied().unwrap_or(1.0);
     let mut tau = min_tau;
     while tau < max_tau {
-        let c = cmnd.get(tau).copied().unwrap_or(1.0);
-        if c < threshold {
+        if at(tau) < threshold {
             // Walk to the local minimum.
-            while tau + 1 < max_tau && cmnd.get(tau + 1).copied().unwrap_or(1.0) < cmnd.get(tau).copied().unwrap_or(1.0) {
+            while tau + 1 < max_tau && at(tau + 1) < at(tau) {
                 tau += 1;
             }
-            // Parabolic interpolation.
-            let (a, b, c) =
-                (cmnd.get(tau - 1).copied().unwrap_or(1.0), cmnd.get(tau).copied().unwrap_or(1.0), cmnd.get(tau + 1).copied().unwrap_or(1.0));
+            // Parabolic interpolation on the raw difference (the normalised curve is skewed by
+            // its running mean, which biases the fractional lag).
+            let raw = |i: usize| d.get(i).copied().unwrap_or(0.0);
+            let (a, b, c) = (raw(tau - 1), raw(tau), raw(tau + 1));
             let denom = a - 2.0 * b + c;
-            let shift = if denom.abs() > 1e-9 { 0.5 * (a - c) / denom } else { 0.0 };
+            let shift = if denom.abs() > 1e-12 { 0.5 * (a - c) / denom } else { 0.0 };
             let t = tau as f32 + shift.clamp(-1.0, 1.0);
             return (t > 0.0).then_some(sample_rate / t);
         }

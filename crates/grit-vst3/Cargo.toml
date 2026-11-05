@@ -1,0 +1,35 @@
+[package]
+name = "soundcraft-grit-vst3"
+description = "Grit as a standalone VST3 plugin: wraps the soundcraft-dsp Grit (multi-style saturation) with the shared Bent Signal editor (an isolated unsafe FFI crate)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+repository.workspace = true
+publish = false
+
+# The VST3 binary is the cdylib (renamed to Grit.vst3 inside the bundle); the rlib is for the tests.
+[lib]
+name = "Grit"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+soundcraft-dsp.workspace = true
+bentsignal-ui.workspace = true
+vst3 = "0.3"
+
+[dev-dependencies]
+soundcraft-vst3-host.workspace = true
+bentsignal-ui = { workspace = true, features = ["capture"] }
+
+# An isolated unsafe helper crate (craftrules never-crash), like shifter-vst3: this crate opts out
+# of the workspace `unsafe_code = "forbid"` for itself only. It denies unsafe everywhere and
+# allows it solely on the COM module (`src/plugin.rs`); the Win32 editor is in `bentsignal-ui`.
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+dbg_macro = "warn"
+todo = "warn"
+too_many_arguments = "allow"
+type_complexity = "allow"
