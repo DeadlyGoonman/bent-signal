@@ -5,7 +5,7 @@
 //! here (they stay on the host's parameter list); the editor draws and handles input in
 //! `bentsignal-ui`.
 
-use crate::params::{self, BYPASS, DAMPEN, FLEX, KEY, KEY_NAMES, MODE, MODEL, PRESETS, REFERENCE, SCALE, SPEED, SYNC};
+use crate::params::{self, BYPASS, FLEX, KEY, KEY_NAMES, MODE, MODEL, PRESETS, REFERENCE, SCALE, SPEED, SYNC};
 use bentsignal_ui::{DropdownSpec, Glyph, KnobSpec, LabelSpec, NumberSpec, RadioSpec, RuleSpec, Theme, ToggleSpec, UiSpec};
 
 const BASE_W: i32 = 360;
@@ -13,10 +13,9 @@ const BASE_H: i32 = 640;
 
 /// Retune is the big dial (its arc starts at 0, so Lock below 0 reads as its own side); Flex is
 /// the small one. Both show their value right under the name.
-static KNOBS: [KnobSpec; 3] = [
+static KNOBS: [KnobSpec; 2] = [
     KnobSpec { id: SPEED, caption: "RETUNE", ends: ("", ""), cx: 180, cy: 170, r: 70, origin: Some(0.0), end_span: None, below: true },
-    KnobSpec { id: FLEX, caption: "FLEX", ends: ("", ""), cx: 56, cy: 392, r: 28, origin: None, end_span: None, below: true },
-    KnobSpec { id: DAMPEN, caption: "DAMPEN", ends: ("", ""), cx: 136, cy: 392, r: 28, origin: None, end_span: None, below: true },
+    KnobSpec { id: FLEX, caption: "FLEX", ends: ("", ""), cx: 90, cy: 392, r: 28, origin: None, end_span: None, below: true },
 ];
 
 static DROPDOWNS: [DropdownSpec; 1] = [DropdownSpec { id: KEY, caption: "KEY", x0: 20, y0: 20, x1: 176, y1: 64, options: &KEY_NAMES }];
@@ -47,7 +46,7 @@ static NUMBERS: [NumberSpec; 1] = [NumberSpec { id: REFERENCE, caption: "A4 Hz",
 
 /// Low Lat is the Mode list shown as a checkbox: checked is Record.
 static TOGGLES: [ToggleSpec; 1] =
-    [ToggleSpec { id: MODE, label: "LOW LAT", cx: 236, cy: 392, glyph: Glyph::Check, on_text: "", off_text: "" }];
+    [ToggleSpec { id: MODE, label: "LOW LAT", cx: 232, cy: 392, glyph: Glyph::Check, on_text: "", off_text: "" }];
 
 pub static SPEC: UiSpec = UiSpec {
     title: "Plumb",
@@ -80,7 +79,7 @@ mod tests {
         layout::assert_layout_ok(&SPEC);
         let l = layout::layout(&SPEC, BASE_W, BASE_H);
         assert_eq!(l.toggles.len(), 1);
-        assert_eq!(l.knobs.len(), 3);
+        assert_eq!(l.knobs.len(), 2);
         assert_eq!((l.dropdowns.len(), l.numbers.len(), l.radios.len(), l.labels.len(), l.rules.len()), (1, 1, 7, 1, 2));
         assert!(l.selector.is_none());
         assert_eq!(layout::default_size(&SPEC), (360, 640), "9:16");
@@ -97,7 +96,7 @@ mod tests {
         ids.sort_unstable();
         ids.dedup();
         // Every parameter but Bypass.
-        assert_eq!(ids, [KEY, SCALE, SPEED, FLEX, REFERENCE, MODE, DAMPEN, SYNC]);
+        assert_eq!(ids, [KEY, SCALE, SPEED, FLEX, REFERENCE, MODE, SYNC]);
         // Major and Minor are scale values 1 and 2; the dots are the groups 1..=5.
         assert_eq!(soundcraft_dsp::plugins::tune::SCALES[1], "Major");
         assert_eq!(soundcraft_dsp::plugins::tune::SCALES[2], "Minor");
@@ -110,7 +109,7 @@ mod tests {
     #[test]
     fn controls_sit_where_they_were_drawn() {
         let l = layout::layout(&SPEC, BASE_W, BASE_H);
-        let (retune, flex, dampen) = (&l.knobs[0], &l.knobs[1], &l.knobs[2]);
+        let (retune, flex) = (&l.knobs[0], &l.knobs[1]);
         let (key, maj, min) = (l.dropdowns[0].rect, l.radios[0].dot, l.radios[1].dot);
         assert_eq!(maj.1, min.1, "Major and Minor on one row");
         assert_eq!((key.top + key.bottom) / 2, maj.1, "level with the key");
@@ -122,8 +121,7 @@ mod tests {
         assert!(retune.value.bottom < rule.top && rule.bottom < flex.cy - flex.r, "the divider is between them");
         let low_lat = l.toggles[0].rect;
         assert_eq!(flex.cy, (low_lat.top + low_lat.bottom) / 2, "Flex and Low Lat on one row");
-        assert!(flex.cx < dampen.cx && dampen.cx < low_lat.left, "Flex, Dampen, Low Lat left to right");
-        assert_eq!(flex.cy, dampen.cy, "Flex and Dampen on one row");
+        assert!(flex.cx < low_lat.left, "Flex left, Low Lat right");
         let dots: Vec<_> = l.radios[2..].iter().map(|r| r.dot).collect();
         assert!(dots.iter().all(|d| d.1 == dots[0].1), "the dots on one row");
         assert!(dots.windows(2).all(|w| w[0].0 < w[1].0));

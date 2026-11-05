@@ -19,20 +19,18 @@ pub fn new_shared() -> Shared {
     Shared::new(&MODEL)
 }
 
-/// VST3 parameter ids 0..=6 are the DSP parameters in table order; 7 is the host bypass.
-pub const DSP_COUNT: usize = 7;
+/// VST3 parameter ids 0..=5 are the DSP parameters in table order; 6 is the host bypass.
+pub const DSP_COUNT: usize = 6;
 pub const KEY: u32 = 0;
 pub const SCALE: u32 = 1;
 pub const SPEED: u32 = 2;
 pub const FLEX: u32 = 3;
 pub const REFERENCE: u32 = 4;
 pub const MODE: u32 = 5;
-/// Dampen: glides between target notes (fake portamento).
-pub const DAMPEN: u32 = 6;
-pub const BYPASS: u32 = 7;
+pub const BYPASS: u32 = 6;
 /// Sync group: 0 Off, 1..=5 link every Plumb in the session that has the same group.
-pub const SYNC: u32 = 8;
-pub const PARAM_COUNT: usize = 9;
+pub const SYNC: u32 = 7;
+pub const PARAM_COUNT: usize = 8;
 /// Number of sync groups.
 pub const SYNC_GROUPS: u32 = 5;
 
@@ -43,7 +41,7 @@ pub const KEY_NAMES: [&str; 12] = ["C", "C#/Db", "D", "D#/Eb", "E", "F", "F#/Gb"
 /// id order; from version 3 the editor's width and height (LE u32 each) follow (0 = not set).
 pub const STATE_MAGIC: [u8; 4] = *b"PLMB";
 /// Version 2 added Mode (id 5) before Bypass; version 3 added Sync (id 7) and the editor size.
-pub const STATE_VERSION: u32 = 4;
+pub const STATE_VERSION: u32 = 3;
 /// Bytes of the fixed header.
 pub const STATE_HEADER: usize = 12;
 
@@ -143,7 +141,7 @@ pub fn format_short(id: u32, n: f64) -> String {
     let plain = to_plain(id, n);
     match id {
         SPEED if plain < 0.0 => format!("Lock {:.0}", -plain),
-        SPEED | FLEX | DAMPEN => format!("{plain:.0}"),
+        SPEED | FLEX => format!("{plain:.0}"),
         _ => format(id, n),
     }
 }
@@ -233,9 +231,8 @@ pub fn decode_values(version: u32, plain: &[f64]) -> [f64; PARAM_COUNT] {
     // Version 1 had no Mode: its sixth value is Bypass.
     let ids: &[u32] = match version {
         0 | 1 => &[0, 1, 2, 3, 4, BYPASS],
-        2 => &[0, 1, 2, 3, 4, 5, BYPASS],
-        3 => &[0, 1, 2, 3, 4, 5, BYPASS, SYNC],
-        _ => &[0, 1, 2, 3, 4, 5, DAMPEN, BYPASS, SYNC],
+        2 => &[0, 1, 2, 3, 4, 5, 6],
+        _ => &[0, 1, 2, 3, 4, 5, 6, SYNC],
     };
     for (&id, v) in ids.iter().zip(plain) {
         if let Some(slot) = out.get_mut(id as usize) {
@@ -264,7 +261,7 @@ pub fn decode_state(bytes: &[u8]) -> Option<Decoded> {
 
 /// Factory presets: plain values for ids 0..=4 (key, scale, speed, flex, reference); bypass
 /// untouched.
-pub static PRESETS: [Preset; 1] = [Preset { name: "Default", values: &[0.0, 1.0, 20.0, 0.0, 440.0, 0.0, 0.0] }];
+pub static PRESETS: [Preset; 1] = [Preset { name: "Default", values: &[0.0, 1.0, 20.0, 0.0, 440.0, 0.0] }];
 
 /// Short marks of the scales for the selector buttons.
 pub const SCALE_MARKS: [&str; 13] = ["CHR", "MAJ", "MIN", "HMI", "MMI", "DOR", "PHR", "LYD", "MIX", "LOC", "PMA", "PMI", "BLU"];
@@ -296,12 +293,11 @@ pub fn tip(id: u32) -> &'static str {
         }
         3 => "Flex Tune: how much of the singer's own deviation from the note is kept. 0% snaps hard; 100% leaves the pitch as sung.",
         4 => "Reference: the frequency of A4, 420 to 460 Hz. Every target note is tuned from it.",
-        6 => "Dampen: fake note transitions. 0% steps straight to each new note; higher glides between notes like a slide, up to about 200 ms.",
         5 => {
             "Mode: Normal (20 ms latency, or Lock) or Record, which tunes with under 1 ms latency for monitoring while you record (no Lock; a little rougher on low voices)."
         }
-        7 => "Bypass: passes the input through unchanged, delayed by the same latency (crossfaded, no click).",
-        8 => "Link: every Plumb in this session set to the same dot shares key, scale, retune speed, flex tune, reference and mode. Click a lit dot to unlink.",
+        6 => "Bypass: passes the input through unchanged, delayed by the same latency (crossfaded, no click).",
+        7 => "Link: every Plumb in this session set to the same dot shares key, scale, retune speed, flex tune, reference and mode. Click a lit dot to unlink.",
         _ => "",
     }
 }
@@ -352,10 +348,10 @@ mod tests {
     #[test]
     fn ids_follow_the_dsp_table() {
         let names: Vec<&str> = (0..PARAM_COUNT as u32).map(title).collect();
-        assert_eq!(names, ["Key", "Scale", "Retune Speed", "Flex Tune", "Reference", "Mode", "Dampen", "Bypass", "Sync"]);
+        assert_eq!(names, ["Key", "Scale", "Retune Speed", "Flex Tune", "Reference", "Mode", "Bypass", "Sync"]);
         let ids: Vec<&str> = (0..DSP_COUNT as u32).filter_map(dsp_param).map(|p| p.id).collect();
-        assert_eq!(ids, ["key", "scale", "speed", "flex", "reference", "mode", "dampen"]);
-        assert_eq!((0..PARAM_COUNT as u32).map(step_count).collect::<Vec<_>>(), [11, 12, 0, 0, 0, 1, 0, 1, 5]);
+        assert_eq!(ids, ["key", "scale", "speed", "flex", "reference", "mode"]);
+        assert_eq!((0..PARAM_COUNT as u32).map(step_count).collect::<Vec<_>>(), [11, 12, 0, 0, 0, 1, 1, 5]);
         assert!(!is_known(PARAM_COUNT as u32));
         assert!((0..PARAM_COUNT as u32).all(|id| !tip(id).is_empty()));
         assert_eq!(scale_name(3), "Harmonic Minor");
