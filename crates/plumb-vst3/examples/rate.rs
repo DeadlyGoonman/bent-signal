@@ -86,6 +86,7 @@ fn render(c: &Ctx, k: &Kind, x: &[f32]) -> Vec<f32> {
             t.set_param("scale", 1.0);
             t.set_param("speed", *speed);
             t.set_param("flex", 0.0);
+            if let Ok(m) = std::env::var("PLUMB_MODE") { t.set_param("mode", m.parse().unwrap_or(0.0)); }
             run(&mut t, x)
         }
         Kind::Xpitch(tr) => {
@@ -152,6 +153,10 @@ fn main() {
     let atp_scale: f32 = std::env::var("ATP_SCALE").ok().and_then(|s| s.parse().ok()).unwrap_or(2.0);
     let c = Ctx { xp: pick("xpitch"), atp: pick("auto-tune pro"), atp_scale };
 
+    if mode == "note" {
+        note(&c);
+        return;
+    }
     if mode == "dbg" {
         dbg(&c);
         return;
@@ -346,5 +351,75 @@ pub fn vocal(c: &Ctx, path: &str, start: f32, len: f32, speeds: &[f32]) {
         let mut jit: Vec<f32> = tr.windows(2).filter(|w| w[1].0 - w[0].0 < 0.0035 && (w[1].1 - w[0].1).abs() < 0.5).map(|w| (w[1].1 - w[0].1).abs() * 100.0).collect();
         jit.sort_by(f32::total_cmp);
         println!("{name:<12} {:>7} {:>8.0}% {:>8.1} {:>8.1} {:>9.2} {:>9.2}", tr.len(), 100.0 * dev.iter().filter(|v| **v < 10.0).count() as f32 / dev.len().max(1) as f32, q(&d, 0.5), q(&d, 0.9), q(&jit, 0.5), q(&jit, 0.95));
+    }
+}
+
+/// Note-to-note transitions: C4 E4 G4 E4 C4 ..., each held 0.5 s, joined by a GLIDE ms
+/// portamento (default 50), sung 25 ct flat. Prints the output pitch (ct from the destination
+/// note) every 10 ms from 40 ms before the glide starts, for the upward moves C4 to E4.
+/// `rate note`; env GLIDE, SPEEDS (default 15,20,50).
+pub fn note(c: &Ctx) {
+    let glide: f32 = std::env::var("GLIDE").ok().and_then(|s| s.parse().ok()).unwrap_or(50.0) / 1000.0;
+    let speeds: Vec<f32> = std::env::var("SPEEDS").unwrap_or("15,20,50".into()).split(',').filter_map(|s| s.parse().ok()).collect();
+    let notes = [60.0f32, 64.0, 67.0, 64.0, 60.0, 64.0, 67.0, 64.0, 60.0];
+    let hold = 0.5f32;
+    let flat = -0.25f32;
+    let target = |t: f32| -> f32 {
+        let i = ((t / hold) as usize).min(notes.len() - 1);
+        let t0 = i as f32 * hold;
+        let prev = if i == 0 { notes[0] } else { notes[i - 1] };
+        let m = if i > 0 && t - t0 < glide { let u = (t - t0) / glide; prev + (notes[i] - prev) * (0.5 - 0.5 * (std::f32::consts::PI * u).cos()) } else { notes[i] };
+        m + flat
+    };
+    let mut x = voice(hold * notes.len() as f32, target);
+    let gap: f32 = std::env::var("GAP").ok().and_then(|s| s.parse().ok()).unwrap_or(0.0) / 1000.0;
+    if gap > 0.0 {
+        for (i, s) in x.iter_mut().enumerate() {
+            let ph = (i as f32 / SR) % hold;
+            let g = if ph < gap { 0.0 } else { ((ph - gap) / 0.01).min(1.0) };
+            *s *= g;
+        }
+    }
+    let tin = track(&x);
+    let at = |tr: &[(f32, f32)], t: f32| tr.iter().min_by(|a, b| (a.0 - t).abs().total_cmp(&(b.0 - t).abs())).filter(|p| (p.0 - t).abs() < 0.012).map(|p| p.1);
+    let mut cols: Vec<(String, Vec<f32>)> = Vec::new();
+    let mut list = vec![("input".to_string(), None)];
+    for &s in &speeds {
+        list.push((format!("plumb_{s}"), Some(Kind::Plumb(s))));
+        list.push((format!("atp_{s}"), Some(Kind::Atp(atp_norm(c, s)))));
+    }
+    for (name, k) in list {
+        let tr = match &k { None => tin.clone(), Some(k) => track(&render(c, k, &x)) };
+        // Align by the lag that best matches the held in-tune parts (plain delay), steady parts only.
+        let mut best = (f32::MAX, 0.0f32);
+        for lag_ms in -10..60 {
+            let lag = lag_ms as f32 / 1000.0;
+            let (mut e, mut n) = (0.0f32, 0);
+            for (t, m) in tin.iter().filter(|(t, _)| *t > 0.1) {
+                if let Some(o) = at(&tr, t + lag) { e += (o - m).abs().min(2.0); n += 1; }
+            }
+            if n > 20 && e / (n as f32) < best.0 { best = (e / n as f32, lag); }
+        }
+        let lag = if k.is_none() { 0.0 } else { best.1 };
+        let mut col = vec![0.0f32; 36];
+        let mut cnt = 0;
+        for i in [1usize, 5] {
+            let t0 = i as f32 * hold;
+            for (j, slot) in col.iter_mut().enumerate() {
+                let t = t0 - 0.04 + j as f32 * 0.01 + lag;
+                *slot += at(&tr, t).map(|m| (m - notes[i]) * 100.0).unwrap_or(f32::NAN);
+            }
+            cnt += 1;
+        }
+        for s in col.iter_mut() { *s /= cnt as f32; }
+        cols.push((format!("{name}({:.0}ms)", lag * 1000.0), col));
+    }
+    print!("{:>6}", "ms");
+    for (n, _) in &cols { print!(" {n:>14}"); }
+    println!();
+    for j in 0..36 {
+        print!("{:>6}", j as i32 * 10 - 40);
+        for (_, c) in &cols { print!(" {:>14.1}", c[j]); }
+        println!();
     }
 }

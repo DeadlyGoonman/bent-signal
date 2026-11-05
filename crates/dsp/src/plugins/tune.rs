@@ -231,6 +231,8 @@ pub struct Tune {
     lock: bool,
     record: bool,
     homing: bool,
+    /// The input was unvoiced since the last voiced sample: the next voiced one starts the correction at its target (no glide from uncorrected).
+    cold: bool,
     // Shifter: one read head; at a splice the old head fades out against the new one.
     t: u64,
     /// The latency's delay (the tap the output rests on after a retune of the whole voice).
@@ -287,6 +289,7 @@ impl Tune {
             lock: false,
             record: false,
             homing: true,
+            cold: true,
             t: 0,
             nominal_d: 960.0,
             home_d: 960.0,
@@ -595,6 +598,7 @@ impl Plugin for Tune {
         self.corr = 0.0;
         self.home = 1.0;
         self.homing = true;
+        self.cold = true;
         self.home_taps();
     }
 
@@ -641,6 +645,13 @@ impl Plugin for Tune {
             let target = if entry.voiced { -(1.0 - self.flex) * entry.dev } else { 0.0 };
             if entry.voiced {
                 self.period = entry.period.clamp(self.sr / MAX_HZ, self.sr / MIN_HZ);
+            }
+            if !entry.voiced {
+                self.cold = true;
+            } else if self.cold {
+                // A voice starting after silence or an unpitched sound has nothing to glide from.
+                self.corr = target;
+                self.cold = false;
             }
             self.corr = target + (self.corr - target) * self.coef;
             if !self.corr.is_finite() {
@@ -833,13 +844,17 @@ mod tests {
     #[test]
     fn retune_speed_sets_the_settling_time() {
         let mut t = plumb(&[("scale", 1.0), ("speed", 60.0)]);
-        let x = sine(440.0 * 2f32.powf(0.3 / 12.0), 24_000);
+        // In tune, then 30 ct sharp inside the same voiced note: the correction glides in. (A voice
+        // starting after silence has nothing to glide from and starts on its target.)
+        let mut x = sine(440.0, 24_000);
+        x.extend(sine(440.0 * 2f32.powf(0.3 / 12.0), 24_000));
         let mut track = Vec::new();
         for s in &x {
             let mut io = vec![vec![*s], vec![*s]];
             t.process(&mut io, 1);
             track.push(t.probe.0);
         }
+        let track = &track[24_000..];
         let first = track.iter().position(|c| c.abs() > 0.003).unwrap();
         let settled = track.iter().position(|c| c.abs() >= 0.95 * 0.3).unwrap();
         let ms = (settled - first) as f32 / SR * 1000.0;
