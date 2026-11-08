@@ -952,6 +952,26 @@ mod tests {
     }
 
     #[test]
+    fn normal_is_on_target_from_an_onset_after_silence() {
+        // A slow retune glides inside a note, but a voice starting after silence has nothing to
+        // glide from: it starts on its target (it used to start uncorrected and slide in).
+        let onset = 12_000usize;
+        let f = 440.0 * 2f32.powf(0.3 / 12.0);
+        let mut x = vec![0.0f32; onset];
+        x.extend(sine(f, 36_000));
+        x.extend(vec![0.0f32; 12_000]);
+        x.extend(sine(f, 36_000));
+        let mut t = plumb(&[("scale", 1.0), ("speed", 100.0)]);
+        let y = run(&mut t, &x);
+        let (lat, hop) = (t.latency(), t.hop * t.dec);
+        for start in [onset, onset + 36_000 + 12_000] {
+            let w = &y[start + lat + hop..start + lat + hop + 2048];
+            let got = yin(w, SR, 60.0, 1600.0, 0.15).unwrap();
+            assert!(cents(got, 440.0).abs() < 5.0, "{got} Hz at the onset at {start}");
+        }
+    }
+
+    #[test]
     fn hostile_input_and_parameters_stay_finite() {
         let mut t = plumb(&[]);
         for v in [f32::NAN, f32::INFINITY, -1e9, 1e9] {
