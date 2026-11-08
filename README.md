@@ -1,12 +1,12 @@
-# Bent Signal VST3
+# Bent Signal
 
-Three small Windows VST3 plugins sharing one editor and one DSP crate. Free, MIT.
+A collection of small audio plugins for Windows (VST3), sharing one editor and one DSP crate. Free, MIT. Three so far:
 
 | Plugin | What it is | Download |
 |---|---|---|
-| **[Plumb](docs/plumb.md)** | Pitch correction. Key, retune speed, flex, low-latency mode, link groups. | `Plumb-VST3-0.2.2-x64.msi` |
-| **[Shifter](docs/shifter.md)** | Micro-pitch doubler: one take sounds double-tracked. | `Shifter-VST3-0.2.2-x64.msi` |
-| **[Grit](docs/grit.md)** | Five-style drive / saturation. | `Grit-VST3-0.2.2-x64.msi` |
+| **[Plumb](docs/plumb.md)** | Pitch correction. Key, retune speed, flex, low-latency mode, link groups. | `Plumb-VST3-0.3.0-x64.msi` |
+| **[Shifter](docs/shifter.md)** | Micro-pitch doubler: one take sounds double-tracked. | `Shifter-VST3-0.3.0-x64.msi` |
+| **[Grit](docs/grit.md)** | Five-style drive / saturation. | `Grit-VST3-0.3.0-x64.msi` |
 
 <p>
 <img src="docs/plumb-ui.png" width="200" alt="Plumb">
@@ -38,7 +38,7 @@ MSIs land in `dist\`. The DLL is `target\release\<Name>.dll`; copy it to `<Name>
 
 ## Status
 
-Version 0.2.2. Tested with the workspace test suite and a host-load test; not yet verified in many DAWs. If something misbehaves, open an issue with your host and version. Design notes: [docs/house-style.md](docs/house-style.md).
+Version 0.3.0. Tested with the workspace test suite and a host-load test; not yet verified in many DAWs. If something misbehaves, open an issue with your host and version. Design notes: [docs/house-style.md](docs/house-style.md).
 
 ## License
 

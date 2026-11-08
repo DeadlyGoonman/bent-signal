@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Bent Signal VST3 MSI (WiX v5), one per plugin. Built by scripts/package.ps1:
+<!-- Bent Signal MSI (WiX v5), one per plugin. Built by scripts/package.ps1:
        wix build plugin.wxs -arch x64 -d Name=Plumb -d Version=... -d BundleDir=... -d UpgradeCode=... -d GuidBin=... -d GuidRes=... -o out.msi -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package

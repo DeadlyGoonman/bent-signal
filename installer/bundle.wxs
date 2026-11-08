@@ -1,9 +1,9 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Bent Signal VST3 MSI (WiX v5): Plumb, Shifter and Grit in one installer, each an optional feature.
+<!-- Bent Signal MSI (WiX v5): Plumb, Shifter and Grit in one installer, each an optional feature.
      Built by scripts/package.ps1 -Plugin Bundle. -->
 <Wix xmlns="http://wixtoolset.org/schemas/v4/wxs">
   <Package
-      Name="Bent Signal VST3 Bundle"
+      Name="Bent Signal Bundle"
       Manufacturer="Bent Signal"
       Version="$(var.Version)"
       UpgradeCode="6E1B4D93-2A87-4C50-9F3E-B8D5A2C71F06"
@@ -12,7 +12,7 @@
       Language="1033">
     <SummaryInformation Description="Plumb, Shifter and Grit VST3 plugins" Manufacturer="Bent Signal" />
     <MajorUpgrade AllowSameVersionUpgrades="yes"
-        DowngradeErrorMessage="A newer version of the Bent Signal VST3 bundle is already installed." />
+        DowngradeErrorMessage="A newer version of the Bent Signal bundle is already installed." />
     <MediaTemplate EmbedCab="yes" CompressionLevel="high" />
 
     <StandardDirectory Id="CommonFiles64Folder">
