@@ -61,7 +61,7 @@ fn the_bundle_loads_and_processes_in_the_soundcraft_host() {
 
     let mut p = soundcraft_vst3_host::create(&d.id).unwrap();
     p.prepare(48_000.0, 512, 2);
-    assert_eq!(p.latency(), 0);
+    assert_eq!(p.latency(), 3, "the 2x oversampling half-band");
     assert!(p.set_param("4", 80.0));
     assert!(p.set_param("0", 3.0));
     assert_eq!(p.param("0"), Some(3.0));

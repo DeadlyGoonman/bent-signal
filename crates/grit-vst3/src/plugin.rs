@@ -10,7 +10,7 @@ use crate::params::{self, BYPASS, PARAM_COUNT, STATE_HEADER, Shared};
 pub use bentsignal_ui::host::{copy_c8, copy_c16};
 use bentsignal_ui::host::set_handler;
 use soundcraft_dsp::Plugin;
-use soundcraft_dsp::plugins::grit::Grit;
+use soundcraft_dsp::plugins::grit::{Grit, latency_samples};
 use std::cell::UnsafeCell;
 use std::ffi::{CStr, c_void};
 use std::sync::Arc;
@@ -37,6 +37,9 @@ pub(crate) struct Engine {
     pub(crate) dsp: Grit,
     wet: Vec<Vec<f32>>,
     dry: Vec<Vec<f32>>,
+    /// The input delayed by the plugin's latency, so bypass stays in time with the output.
+    dry_line: Vec<Vec<f32>>,
+    dry_pos: usize,
     max_block: usize,
     sample_rate: f64,
     generation: u64,
@@ -53,6 +56,8 @@ impl Engine {
             dsp: Grit::new(),
             wet: Vec::new(),
             dry: Vec::new(),
+            dry_line: Vec::new(),
+            dry_pos: 0,
             max_block: 0,
             sample_rate: 48_000.0,
             generation: u64::MAX,
@@ -71,6 +76,8 @@ impl Engine {
         self.max_block = max;
         self.wet = vec![vec![0.0; max]; 2];
         self.dry = vec![vec![0.0; max]; 2];
+        self.dry_line = vec![vec![0.0; (latency_samples() + 1).next_power_of_two()]; 2];
+        self.dry_pos = 0;
         self.dsp.prepare(sr as f32, max, 2);
         // 10 ms bypass crossfade.
         self.bypass_step = (1.0 / (0.01 * sr)) as f32;
@@ -123,17 +130,24 @@ impl Engine {
                 return;
             }
             let n = (len - done).min(self.max_block);
+            let lat = latency_samples();
             for c in 0..2 {
                 let src = if ins.is_empty() { None } else { ins.get(c.min(ins.len() - 1)).copied() };
-                let (Some(w), Some(d)) = (self.wet.get_mut(c), self.dry.get_mut(c)) else { continue };
+                let (Some(w), Some(d), Some(line)) = (self.wet.get_mut(c), self.dry.get_mut(c), self.dry_line.get_mut(c)) else { continue };
+                let mask = line.len().wrapping_sub(1);
                 for (i, (w, d)) in w.iter_mut().zip(d.iter_mut()).take(n).enumerate() {
                     // SAFETY: see the function's contract.
                     let x = src.map(|s| unsafe { *s.add(at + i) }).unwrap_or(0.0);
                     *w = x;
-                    *d = x;
+                    let pos = self.dry_pos.wrapping_add(i);
+                    if let Some(slot) = line.get_mut(pos & mask) {
+                        *slot = if x.is_finite() { x } else { 0.0 };
+                    }
+                    *d = line.get(pos.wrapping_sub(lat) & mask).copied().unwrap_or(0.0);
                     self.block_peak = self.block_peak.max(x.abs());
                 }
             }
+            self.dry_pos = self.dry_pos.wrapping_add(n);
             self.dsp.process(&mut self.wet, n);
             for i in 0..n {
                 let b = self.bypass_mix;
@@ -392,8 +406,8 @@ impl IAudioProcessorTrait for GritPlugin {
         if size == SymbolicSampleSizes_::kSample32 as i32 { kResultTrue } else { kResultFalse }
     }
     unsafe fn getLatencySamples(&self) -> u32 {
-        // No oversampling and no look-ahead.
-        0
+        // The 2x oversampling half-band; constant.
+        latency_samples() as u32
     }
     unsafe fn setupProcessing(&self, setup: *mut ProcessSetup) -> tresult {
         // SAFETY: the host passes a valid setup or null.

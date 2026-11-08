@@ -354,6 +354,10 @@ fn every_style_is_finite_under_a_loud_burst() {
     }
 }
 
+fn p_latency() -> usize {
+    soundcraft_dsp::plugins::grit::latency_samples()
+}
+
 #[test]
 fn mix_zero_passes_the_input_through_untouched() {
     let (_c, p, e) = prepared(48_000.0, 480);
@@ -367,7 +371,10 @@ fn mix_zero_passes_the_input_through_untouched() {
     }
     let mut io = [x.clone(), x.clone()];
     run(&p, &mut io, None);
-    assert!(io[0].iter().zip(&x).all(|(a, b)| a.to_bits() == b.to_bits()));
+    // The output is the input delayed by the latency (the previous block was the same input).
+    let lat = p_latency();
+    assert!(lat > 0);
+    assert!(io[0].iter().enumerate().all(|(i, a)| a.to_bits() == x[(i + x.len() - lat) % x.len()].to_bits()));
 }
 
 #[test]
@@ -380,7 +387,9 @@ fn bypass_passes_the_input_through() {
     let x: Vec<f32> = (0..480).map(|i| (i as f32 * 0.05).sin() * 0.5).collect();
     let mut io = [x.clone(), x.clone()];
     run(&p, &mut io, None);
-    assert!(io[0].iter().zip(&x).all(|(a, b)| (a - b).abs() < 1e-6));
+    // Bypass is delayed by the latency too (the block before was silent).
+    let lat = p_latency();
+    assert!(io[0].iter().enumerate().all(|(i, a)| (a - if i >= lat { x[i - lat] } else { 0.0 }).abs() < 1e-6));
 }
 
 #[test]
@@ -417,6 +426,8 @@ fn parameter_changes_are_sample_accurate() {
     for _ in 0..200 {
         run(&p, &mut [vec![0.0; 256], vec![0.0; 256]], None);
     }
+    // A steady input first: the oversampling filters ring after a step from silence.
+    run(&p, &mut [vec![0.1; 256], vec![0.1; 256]], None);
     let ch = changes(&[(OUTPUT, &[(100, hi)])]);
     let mut io = [vec![0.1f32; 256], vec![0.1f32; 256]];
     run(&p, &mut io, Some(&ch));
@@ -447,7 +458,8 @@ fn editor_edits_reach_the_host_handler() {
 fn tail_and_latency() {
     let (_c, p, _e) = prepared(48_000.0, 256);
     unsafe {
-        assert_eq!(p.getLatencySamples(), 0);
+        assert_eq!(p.getLatencySamples() as usize, p_latency());
+        assert_eq!(p.getLatencySamples(), 3);
         assert_eq!(p.getTailSamples(), 2400);
         assert_eq!(p.canProcessSampleSize(SymbolicSampleSizes_::kSample64 as i32), kResultFalse);
         let mut mono = [SpeakerArr::kMono];

@@ -2,7 +2,8 @@
 //! `soundcraft-dsp` Grit multi-style saturation behind the VST3 COM interfaces, with the shared Bent Signal editor (`bentsignal-ui`).
 //!
 //! - One audio module class ("Grit", `Fx|Distortion`), a single-component plugin: the component is
-//!   also its edit controller. Stereo in, stereo out, 32-bit float, latency 0.
+//!   also its edit controller. Stereo in, stereo out, 32-bit float, latency
+//!   `soundcraft_dsp::plugins::grit::latency_samples()` (the 2x oversampling half-band).
 //! - Parameters (stable ids): 0 Style, 1 Low Cut, 2 Thump, 3 Tone, 4 Drive, 5 Punish, 6 High Cut,
 //!   7 Steep, 8 Output, 9 Auto, 10 Mix, 11 Bypass. Normalized values map through the DSP's own
 //!   `ParamInfo` ranges. Changes are applied sample-accurately.

@@ -7,9 +7,14 @@
 //! Every shaper has unit slope at the origin and the pre-gain bottoms out at 0.01, so at Drive 0
 //! the wet path equals the input (within rounding) in every style. Asymmetric styles pass through
 //! a DC blocker. The curves are textbook shapes (tanh, biased tanh, algebraic sigmoids), not
-//! models of any particular device. Mix 0 returns the input untouched (the output gain only
-//! applies to the wet path).
+//! models of any particular device. Mix 0 returns the input (delayed by the latency; the output
+//! gain only applies to the wet path).
+//!
+//! The shaper runs at 2x the sample rate (a polyphase IIR half-band, a few samples of latency) so
+//! its harmonics do not fold back as aliasing. The dry path is delayed by the same latency, so
+//! the Mix blend stays in phase.
 
+use crate::halfband::{Downsampler2x, GRIT_N, GRIT_TRANSITION, Upsampler2x, chain_latency, halfband_coefs};
 use crate::params::{Params, choice, lin, log, param_plumbing, toggle};
 use crate::util::{DcBlocker, Smoother, flush, frames_in, sane_channels, sane_sr};
 use crate::{Category, ParamInfo, Plugin, PluginInfo, Unit, db_to_gain};
@@ -115,9 +120,27 @@ impl Svf {
     }
 }
 
+/// Dry delay ring size (a power of two above the latency).
+const DRY_RING: usize = 8;
+
+/// Latency of the oversampling chain in samples (its low-frequency group delay, rounded). The
+/// same at every sample rate.
+pub fn latency_samples() -> usize {
+    (chain_latency(&halfband_coefs(GRIT_N, GRIT_TRANSITION)).round().max(0.0) as usize).min(DRY_RING - 1)
+}
+
 pub struct Grit {
     p: Params,
     sr: f32,
+    up: Vec<Upsampler2x>,
+    down: Vec<Downsampler2x>,
+    /// Dry path delay per channel, written at `dry_pos`.
+    dry_ring: Vec<[f32; DRY_RING]>,
+    dry_pos: usize,
+    /// Latency of the oversampling chain in samples.
+    latency: usize,
+    /// Oversampling on (tests turn it off to measure the aliasing it removes).
+    oversample: bool,
     dc: Vec<DcBlocker>,
     svf: Vec<Svf>,
     tilt: Vec<f32>,
@@ -144,6 +167,12 @@ impl Grit {
         let mut s = Self {
             p: Params::new(&GRIT_PARAMS),
             sr: 48_000.0,
+            up: Vec::new(),
+            down: Vec::new(),
+            dry_ring: Vec::new(),
+            dry_pos: 0,
+            latency: latency_samples(),
+            oversample: true,
             dc: Vec::new(),
             svf: Vec::new(),
             tilt: Vec::new(),
@@ -194,6 +223,11 @@ impl Plugin for Grit {
     fn prepare(&mut self, sample_rate: f32, _max_block: usize, channels: usize) {
         self.sr = sane_sr(sample_rate);
         let ch = sane_channels(channels);
+        let coefs = halfband_coefs(GRIT_N, GRIT_TRANSITION);
+        self.latency = latency_samples();
+        self.up = vec![Upsampler2x::new(&coefs); ch];
+        self.down = vec![Downsampler2x::new(&coefs); ch];
+        self.dry_ring = vec![[0.0; DRY_RING]; ch];
         self.dc = vec![DcBlocker::new(3.0, self.sr); ch];
         self.svf = vec![Svf::default(); ch];
         self.tilt = vec![0.0; ch];
@@ -206,11 +240,19 @@ impl Plugin for Grit {
     }
 
     fn reset(&mut self) {
+        self.up.iter_mut().for_each(Upsampler2x::reset);
+        self.down.iter_mut().for_each(Downsampler2x::reset);
+        self.dry_ring.iter_mut().for_each(|r| *r = [0.0; DRY_RING]);
+        self.dry_pos = 0;
         self.dc.iter_mut().for_each(DcBlocker::reset);
         self.svf.iter_mut().for_each(|s| *s = Svf::default());
         self.tilt.iter_mut().for_each(|v| *v = 0.0);
         self.cut.iter_mut().for_each(|v| *v = [0.0; 5]);
         self.snap();
+    }
+
+    fn latency(&self) -> usize {
+        self.latency
     }
 
     fn process(&mut self, io: &mut [Vec<f32>], frames: usize) {
@@ -220,6 +262,7 @@ impl Plugin for Grit {
         let auto = self.p.on(9);
         let poles = if self.p.on(7) { 5 } else { 1 };
         let (sf, sd, tk, ck) = (self.svf_f, self.svf_damp, self.tilt_k, self.cut_k);
+        let (lat, os) = (self.latency, self.oversample);
         for n in 0..frames {
             let g = self.drive.next();
             let t = self.tone.next();
@@ -232,13 +275,18 @@ impl Plugin for Grit {
                 else {
                     continue;
                 };
+                let (Some(up), Some(down), Some(ring)) = (self.up.get_mut(c), self.down.get_mut(c), self.dry_ring.get_mut(c)) else { continue };
                 let Some(x) = buf.get_mut(n) else { continue };
-                let dry = if x.is_finite() { *x } else { 0.0 };
+                let input = if x.is_finite() { *x } else { 0.0 };
+                if let Some(slot) = ring.get_mut(self.dry_pos & (DRY_RING - 1)) {
+                    *slot = input;
+                }
+                let dry = ring.get(self.dry_pos.wrapping_sub(lat) & (DRY_RING - 1)).copied().unwrap_or(0.0);
                 if m <= 0.0 {
                     *x = dry;
                     continue;
                 }
-                let mut y = dry;
+                let mut y = input;
                 if sf > 0.0 {
                     y = svf.high_pass(y, sf, sd);
                 }
@@ -246,7 +294,12 @@ impl Plugin for Grit {
                     *tl = flush(*tl + (y - *tl) * tk);
                     y = *tl * g_lo + (y - *tl) * g_hi;
                 }
-                y = drive_stage(style, g, y, auto);
+                y = if os {
+                    let (a, b) = up.process(y);
+                    down.process(drive_stage(style, g, a, auto), drive_stage(style, g, b, auto))
+                } else {
+                    drive_stage(style, g, y, auto)
+                };
                 if is_asymmetric(style) {
                     y = dc.process(y);
                 }
@@ -259,6 +312,7 @@ impl Plugin for Grit {
                 let wet = if y.is_finite() { y * o } else { 0.0 };
                 *x = dry * (1.0 - m) + wet * m;
             }
+            self.dry_pos = self.dry_pos.wrapping_add(1);
         }
     }
 }
@@ -331,7 +385,9 @@ mod tests {
             for auto in [false, true] {
                 let x = sine(0.5);
                 let y = run(&mut make(style, 0.0, 100.0, auto), &x);
-                let err = x.iter().zip(&y).skip(N / 2).map(|(a, b)| (a - b).abs()).fold(0.0, f32::max);
+                // The output is the input delayed by the oversampling latency.
+                let lat = latency_samples();
+                let err = (N / 2..N).map(|i| (x[i - lat] - y[i]).abs()).fold(0.0, f32::max);
                 assert!(err < 1e-2, "{} auto {auto}: {err}", name(style));
             }
         }
@@ -346,7 +402,10 @@ mod tests {
             g.set_param("low_cut", 300.0);
             g.set_param("tone", 100.0);
             let y = run(&mut g, &x);
-            assert!(x.iter().zip(&y).all(|(a, b)| a.to_bits() == b.to_bits()), "{}", name(style));
+            let lat = g.latency();
+            assert!(lat > 0);
+            let delayed = |i: usize| if i >= lat { x[i - lat] } else { 0.0 };
+            assert!((0..x.len()).all(|i| y[i].to_bits() == delayed(i).to_bits()), "{}", name(style));
         }
     }
 
@@ -440,6 +499,34 @@ mod tests {
         let mut bright = make(0, 0.0, 100.0, false);
         bright.set_param("tone", 100.0);
         assert!(rms(&run(&mut bright, &hi)) > 2.0 * rms(&run(&mut dark, &hi)));
+    }
+
+    /// Everything except the `f` fundamental (fitted and subtracted), as an RMS.
+    fn residual(y: &[f32], f: f32) -> f32 {
+        let tail = &y[N / 2..];
+        let (mut re, mut im) = (0.0f64, 0.0f64);
+        let w = |i: usize| std::f64::consts::TAU * f64::from(f) * (i + N / 2) as f64 / 48_000.0;
+        for (i, v) in tail.iter().enumerate() {
+            re += f64::from(*v) * w(i).cos();
+            im += f64::from(*v) * w(i).sin();
+        }
+        let (a, b) = (2.0 * re / tail.len() as f64, 2.0 * im / tail.len() as f64);
+        let e: f64 = tail.iter().enumerate().map(|(i, v)| (f64::from(*v) - a * w(i).cos() - b * w(i).sin()).powi(2)).sum();
+        (e / tail.len() as f64).sqrt() as f32
+    }
+
+    #[test]
+    fn oversampling_cuts_aliasing() {
+        // Pentode, high drive, a -20 dBFS 15 kHz tone. (Driven into full clipping at 0 dBFS, 2x only
+        // buys about 3 dB: a square wave's harmonics hardly decay.)
+        let x = sine_at(15_000.0, 0.1);
+        let mut on = make(4, 80.0, 100.0, false);
+        let mut off = make(4, 80.0, 100.0, false);
+        off.oversample = false;
+        let (a_on, a_off) = (residual(&run(&mut on, &x), 15_000.0), residual(&run(&mut off, &x), 15_000.0));
+        let db = 20.0 * (a_off / a_on).log10();
+        println!("alias residual: oversampled {:.1} dB, plain {:.1} dB, {db:.1} dB less", 20.0 * a_on.log10(), 20.0 * a_off.log10());
+        assert!(db >= 15.0, "only {db} dB less aliasing");
     }
 
     #[test]
