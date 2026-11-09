@@ -303,7 +303,9 @@ impl IPlugViewTrait for View {
             user: None,
             last_preset: 0,
             last_meter: 0,
+            update: Default::default(),
         });
+        let slot = win.update.clone();
         // SAFETY: our window; the box is reclaimed in WM_NCDESTROY.
         unsafe {
             SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(win) as isize);
@@ -311,6 +313,7 @@ impl IPlugViewTrait for View {
             InvalidateRect(hwnd, std::ptr::null(), 0);
         }
         self.hwnd.set(hwnd);
+        crate::update_win::spawn_check(hwnd as usize, slot);
         kResultOk
     }
     unsafe fn removed(&self) -> tresult {
@@ -405,6 +408,8 @@ pub struct Win {
     last_preset: usize,
     /// The meter level (bits) last drawn.
     last_meter: u32,
+    /// Where the update-check thread leaves a release to ask about.
+    update: crate::update_win::Slot,
 }
 
 fn client_size(hwnd: HWND) -> (i32, i32) {
@@ -683,6 +688,15 @@ unsafe extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) 
                 }
             }
         }
+        return 0;
+    }
+    if msg == crate::update_win::WM_UPDATE_READY {
+        // SAFETY: short borrow; the modal box below can re-enter, or let the host destroy the window.
+        let (slot, title) = {
+            let w = unsafe { &*ptr };
+            (w.update.clone(), w.spec.title)
+        };
+        crate::update_win::on_update_ready(hwnd as usize, &slot, title);
         return 0;
     }
     // SAFETY: as above (no handler below re-enters the window procedure).

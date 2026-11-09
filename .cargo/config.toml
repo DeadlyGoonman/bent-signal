@@ -1,0 +1,4 @@
+# cargo test / cargo run: the plugins' update check stays off, so tests that open an editor never
+# reach GitHub or write %APPDATA%\Bent Signal\update.json. Override: BENTSIGNAL_UPDATE_OFF=0.
+[env]
+BENTSIGNAL_UPDATE_OFF = "1"

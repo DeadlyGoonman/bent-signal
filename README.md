@@ -36,6 +36,12 @@ Installers (needs WiX v5: `dotnet tool install --global wix --version 5.0.2`):
 
 MSIs land in `dist\`. The DLL is `target\release\<Name>.dll`; copy it to `<Name>.vst3\Contents\x86_64-win\<Name>.vst3` inside a `.vst3` folder to install by hand.
 
+## Update check
+
+When a plugin editor opens, it makes one GET request to `api.github.com` (the latest release of this repository) to see whether a newer version exists, at most once a day across all Bent Signal plugins. Nothing else is sent. If a newer release exists you are shown its patch notes and asked whether to open the download page; you can also be reminded tomorrow or skip that version. The check runs on a background thread and never touches audio.
+
+To turn it off, set `"enabled": false` in `%APPDATA%\Bent Signal\update.json` (the file is created on the first check).
+
 ## Status
 
 Version 0.3.0. Tested with the workspace test suite and a host-load test; not yet verified in many DAWs. If something misbehaves, open an issue with your host and version. Design notes: [docs/house-style.md](docs/house-style.md).
