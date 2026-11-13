@@ -48,6 +48,9 @@ Hover any control in the editor for a short tooltip.
 | Slow Drift | Drift | 15 | 10 | 150 | 100 | 50 | 0 | off |
 | Mono-Safe Spread | Spread | 20 | 12 | 180 | 100 | 60 | 0 | off |
 | Hollow Swap | Twin | 14 | 9 | 120 | 100 | 50 | 0 | on |
+| Tight Double | Twin | 6 | 4 | 150 | 100 | 50 | 0 | off |
+| Open Double | Twin | 10 | 8 | 150 | 100 | 50 | 0 | off |
+| Broad Double | Twin | 16 | 12 | 150 | 100 | 50 | 0 | off |
 
 ## Notes
 

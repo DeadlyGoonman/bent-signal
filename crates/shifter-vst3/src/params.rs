@@ -199,13 +199,16 @@ pub fn decode_state(bytes: &[u8]) -> Option<[f64; PARAM_COUNT]> {
 }
 
 /// Factory presets: name and plain values for ids 0..=7 (bypass untouched).
-pub static PRESETS: [Preset; 6] = [
+pub static PRESETS: [Preset; 9] = [
     Preset { name: "Default", values: &[0.0, 12.0, 9.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
     Preset { name: "Gentle Double", values: &[0.0, 8.0, 5.0, 150.0, 100.0, 35.0, 0.0, 0.0] },
     Preset { name: "Wide Twin", values: &[0.0, 18.0, 14.0, 200.0, 100.0, 60.0, -1.0, 0.0] },
     Preset { name: "Slow Drift", values: &[1.0, 15.0, 10.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
     Preset { name: "Mono-Safe Spread", values: &[2.0, 20.0, 12.0, 180.0, 100.0, 60.0, 0.0, 0.0] },
     Preset { name: "Hollow Swap", values: &[0.0, 14.0, 9.0, 120.0, 100.0, 50.0, 0.0, 1.0] },
+    Preset { name: "Tight Double", values: &[0.0, 6.0, 4.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
+    Preset { name: "Open Double", values: &[0.0, 10.0, 8.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
+    Preset { name: "Broad Double", values: &[0.0, 16.0, 12.0, 150.0, 100.0, 50.0, 0.0, 0.0] },
 ];
 
 /// The Shifter's parameters as the shared editor sees them.
